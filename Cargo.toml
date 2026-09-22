@@ -1,0 +1,42 @@
+[workspace]
+resolver = "3"
+members = ["crates/*"]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.86"
+license = "MIT"
+
+# One place for all dependency versions.
+# Member crates use `name.workspace = true`.
+# A crate listed here is compiled only when a member crate uses it.
+[workspace.dependencies]
+# Runtime and gossip
+tokio = { version = "1.53", features = ["macros", "rt-multi-thread", "signal", "time", "sync", "net"] }
+chitchat = "0.13"
+
+# Errors, logging, CLI
+anyhow = "1"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+clap = { version = "4.6", features = ["derive", "env"] }
+
+# Serialization
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+
+# Cluster-scope clock
+uhlc = "0.9"
+
+# Node API
+axum = "0.8"
+utoipa = "6.0"
+
+# Local Docker.
+bollard = "0.21"
+
+# WireGuard and bootstrap keys
+defguard_wireguard_rs = "0.12"
+hkdf = "0.13"
+x25519-dalek = "3"
