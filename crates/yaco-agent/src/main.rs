@@ -41,11 +41,11 @@ async fn main() -> anyhow::Result<()> {
     tokio::select! {
         _ = gossip::log_membership(&handle) => {
             tracing::error!("chitchat stopped");
+            handle.shutdown().await
         }
         _ = tokio::signal::ctrl_c() => {
-            tracing::info!("shutting down");
+            tracing::info!("leaving the cluster");
+            gossip::leave(handle, gossip::DEFAULT_GOSSIP_INTERVAL).await
         }
     }
-
-    handle.shutdown().await
 }

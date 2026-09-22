@@ -12,6 +12,15 @@ use chitchat::{
 pub const CLUSTER_ID: &str = "yaco";
 pub const DEFAULT_GOSSIP_INTERVAL: Duration = Duration::from_secs(1);
 
+/// A node sets this key just before it shuts down.
+/// Other nodes then remove it from the live set at once,
+/// instead of after the failure detector timeout.
+pub const LEAVING_KEY: &str = "leaving";
+
+/// Gossip rounds to wait after setting `LEAVING_KEY`,
+/// so that the key reaches the other nodes.
+pub const LEAVE_ROUNDS: u32 = 3;
+
 /// Builds a chitchat config with the chitchat default values.
 ///
 /// `seeds` are gossip addresses of other nodes.
@@ -31,7 +40,9 @@ pub fn config(
         failure_detector_config: FailureDetectorConfig::default(),
         marked_for_deletion_grace_period: Duration::from_secs(60 * 60),
         catchup_callback: None,
-        extra_liveness_predicate: None,
+        extra_liveness_predicate: Some(Box::new(|node_state| {
+            node_state.get(LEAVING_KEY).is_none()
+        })),
         // Every node is new, so all nodes understand V1.
         protocol_version: ProtocolVersion::V1,
     }
@@ -42,16 +53,27 @@ pub async fn start(config: ChitchatConfig) -> anyhow::Result<ChitchatHandle> {
     spawn_chitchat(config, Vec::new(), &UdpTransport).await
 }
 
+/// Leaves the cluster gracefully and stops chitchat.
+pub async fn leave(handle: ChitchatHandle, gossip_interval: Duration) -> anyhow::Result<()> {
+    handle
+        .with_chitchat(|chitchat| chitchat.self_node_state().set(LEAVING_KEY, "true"))
+        .await;
+    tokio::time::sleep(gossip_interval * LEAVE_ROUNDS).await;
+    handle.shutdown().await
+}
+
 /// Returns the sorted node IDs of all live nodes, self included.
+///
+/// Reads the live-nodes watcher, not `Chitchat::live_nodes()`,
+/// because only the watcher applies `extra_liveness_predicate`.
+/// The watcher is updated once per gossip round.
 pub async fn live_node_ids(handle: &ChitchatHandle) -> Vec<String> {
-    let chitchat = handle.chitchat();
-    let chitchat = chitchat.lock().await;
-    let mut ids: Vec<String> = chitchat
-        .live_nodes()
+    let watcher = handle.chitchat().lock().await.live_nodes_watcher();
+    watcher
+        .borrow()
+        .keys()
         .map(|id| id.node_id.to_string())
-        .collect();
-    ids.sort();
-    ids
+        .collect()
 }
 
 /// Logs the live node set every time it changes.
