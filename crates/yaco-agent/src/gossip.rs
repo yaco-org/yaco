@@ -49,8 +49,12 @@ pub fn config(
 }
 
 /// Starts chitchat in a background tokio task.
-pub async fn start(config: ChitchatConfig) -> anyhow::Result<ChitchatHandle> {
-    spawn_chitchat(config, Vec::new(), &UdpTransport).await
+/// `key_values` are published in the own namespace from the start.
+pub async fn start(
+    config: ChitchatConfig,
+    key_values: Vec<(String, String)>,
+) -> anyhow::Result<ChitchatHandle> {
+    spawn_chitchat(config, key_values, &UdpTransport).await
 }
 
 /// Leaves the cluster gracefully and stops chitchat.

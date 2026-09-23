@@ -22,7 +22,7 @@ async fn start_cluster(names: &[&str], first_port: u16) -> Vec<ChitchatHandle> {
         let listen = addr(first_port + i as u16);
         let seeds = if i == 0 { vec![] } else { vec![seed] };
         let config = gossip::config(name, listen, &seeds, GOSSIP_INTERVAL);
-        handles.push(gossip::start(config).await.unwrap());
+        handles.push(gossip::start(config, Vec::new()).await.unwrap());
     }
     handles
 }

@@ -39,4 +39,5 @@ bollard = "0.21"
 # WireGuard and bootstrap keys
 defguard_wireguard_rs = "0.12"
 hkdf = "0.13"
+sha2 = "0.11"
 x25519-dalek = "3"
