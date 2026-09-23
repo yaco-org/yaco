@@ -29,8 +29,9 @@ serde_json = "1"
 # Cluster-scope clock
 uhlc = "0.9"
 
-# Node API
+# Node API and join endpoint
 axum = "0.8"
+reqwest = { version = "0.13", default-features = false, features = ["json"] }
 utoipa = "6.0"
 
 # Local Docker.

@@ -1,6 +1,8 @@
 #!/bin/sh
-# Starts three agents, each in its own network namespace,
-# and checks that every node reaches every other node over the mesh.
+# Starts three agents, each in its own network namespace.
+# n2 and n3 join through n1 over the bootstrap tunnel.
+# Checks that every node reaches every other node over the mesh,
+# and that a fourth node with a wrong join token cannot join.
 #
 # The script runs itself in a new user namespace,
 # where it has CAP_NET_ADMIN over the namespaces that it creates.
@@ -21,6 +23,8 @@ fi
 AGENT=${YACO_AGENT:?set YACO_AGENT to the yaco-agent binary}
 LOG_DIR=${YACO_LOG_DIR:-$(mktemp -d)}
 NODES="1 2 3"
+TOKEN="netns-test-token-0123456789"
+WRONG_TOKEN="netns-test-token-wrong-9876"
 
 pids=""
 cleanup() {
@@ -33,9 +37,9 @@ trap cleanup EXIT
 
 fail() {
   echo "FAIL: $*"
-  for n in $NODES; do
+  for n in $NODES 4; do
     echo "--- log of n$n"
-    cat "$LOG_DIR/n$n.log"
+    cat "$LOG_DIR/n$n.log" 2>/dev/null || true
   done
   exit 1
 }
@@ -49,7 +53,7 @@ mkdir -p /run/netns
 ip link set lo up
 ip link add yaco-test-br type bridge
 ip link set yaco-test-br up
-for n in $NODES; do
+for n in $NODES 4; do
   ip netns add "n$n"
   ip link add "yaco-test-v$n" type veth peer name eth0 netns "n$n"
   ip link set "yaco-test-v$n" master yaco-test-br up
@@ -58,18 +62,24 @@ for n in $NODES; do
   ip -n "n$n" link set eth0 up
 done
 
-# Start the agents. Node n1 is the seed.
+# Start the agents. Node n1 starts the cluster, the others join through it.
+# The seed address is the public bootstrap endpoint of n1.
 for n in $NODES; do
   seed=""
   if [ "$n" != 1 ]; then
-    seed="--seed 10.99.0.1:7280"
+    seed="--seed 10.99.0.1:7282"
   fi
   # shellcheck disable=SC2086
-  ip netns exec "n$n" "$AGENT" --node-id "n$n" --listen "10.99.0.$n:7280" $seed \
+  YACO_TOKEN=$TOKEN ip netns exec "n$n" "$AGENT" --node-id "n$n" --listen "10.99.0.$n:7280" $seed \
     >"$LOG_DIR/n$n.log" 2>&1 &
   pids="$pids $!"
   last_pid=$!
 done
+
+# n4 has a wrong token. It runs in parallel and must give up.
+YACO_TOKEN=$WRONG_TOKEN ip netns exec n4 "$AGENT" --node-id n4 --listen 10.99.0.4:7280 \
+  --seed 10.99.0.1:7282 >"$LOG_DIR/n4.log" 2>&1 &
+intruder_pid=$!
 
 mesh_ip() {
   ip -n "$1" -4 -o addr show dev yaco-mesh 2>/dev/null | awk '{print $4}' | cut -d/ -f1
@@ -114,5 +124,21 @@ for n in 1 2; do
   done
   echo "ok: n$n removed the peer of n3"
 done
+
+# The node with the wrong token must fail to join and exit.
+deadline=$(($(date +%s) + 60))
+while kill -0 "$intruder_pid" 2>/dev/null; do
+  [ "$(date +%s)" -lt "$deadline" ] || fail "n4 with a wrong token did not give up"
+  sleep 1
+done
+if wait "$intruder_pid"; then
+  fail "n4 with a wrong token exited with success"
+fi
+grep -q "cannot join through any seed" "$LOG_DIR/n4.log" || fail "n4 exited for another reason"
+grep -q "accepted join" "$LOG_DIR/n1.log" || fail "n1 accepted no join"
+if grep -q "node_id=n4" "$LOG_DIR/n1.log"; then
+  fail "n1 received a join request from n4"
+fi
+echo "ok: n4 with a wrong token cannot join"
 
 echo "PASS"

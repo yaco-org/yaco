@@ -2,6 +2,9 @@
 //!
 //! Every node publishes its WireGuard facts in its own chitchat namespace.
 //! Every node makes its peer list from the facts of all live nodes.
+//! A node that joins gets its first peers from the join response (see `join`),
+//! before gossip has them. `PendingPeers` keeps those peers configured
+//! until they appear in gossip.
 //! In this stage chitchat still runs on the public UDP port,
 //! so the mesh does not carry gossip yet.
 
@@ -9,7 +12,8 @@ mod tests;
 
 use std::collections::BTreeMap;
 use std::net::{IpAddr, Ipv4Addr, SocketAddr};
-use std::time::Duration;
+use std::sync::Mutex;
+use std::time::{Duration, Instant};
 
 use anyhow::Context;
 use chitchat::{ChitchatHandle, ChitchatId, NodeState};
@@ -17,7 +21,9 @@ use defguard_wireguard_rs::key::Key;
 use defguard_wireguard_rs::net::IpAddrMask;
 use defguard_wireguard_rs::peer::Peer;
 use defguard_wireguard_rs::{InterfaceConfiguration, Kernel, WGApi, WireguardInterfaceApi};
+use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
+use tokio::sync::Notify;
 
 /// Name of the main mesh interface.
 /// The `yaco-` prefix keeps it apart from interfaces of other tools,
@@ -40,8 +46,11 @@ pub const ENDPOINT_KEY: &str = "facts/endpoint";
 /// How often `sync_peers` retries without a membership change.
 pub const RESYNC_INTERVAL: Duration = Duration::from_secs(30);
 
+/// How long a pending peer stays configured without appearing in gossip.
+pub const PENDING_TTL: Duration = Duration::from_secs(60);
+
 /// One remote node, as the WireGuard peer list needs it.
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct MeshPeer {
     /// Base64, as `wg` prints it.
     pub public_key: String,
@@ -58,7 +67,7 @@ impl MeshPeer {
         endpoint: Option<&str>,
     ) -> anyhow::Result<MeshPeer> {
         let public_key = public_key.context("missing wg_public_key")?;
-        Key::try_from(public_key).map_err(|err| anyhow::anyhow!("bad wg_public_key: {err}"))?;
+        check_public_key(public_key)?;
         let mesh_ip = mesh_ip
             .context("missing mesh_ip")?
             .parse()
@@ -82,6 +91,18 @@ impl MeshPeer {
             (ENDPOINT_KEY.to_string(), self.endpoint.to_string()),
         ]
     }
+}
+
+/// Checks that `public_key` is a base64 WireGuard key.
+pub fn check_public_key(public_key: &str) -> anyhow::Result<()> {
+    Key::try_from(public_key).map_err(|err| anyhow::anyhow!("bad wg_public_key: {err}"))?;
+    Ok(())
+}
+
+/// Returns true if `ip` is a host address in the mesh subnet.
+pub fn is_mesh_ip(ip: Ipv4Addr) -> bool {
+    let host = u32::from(ip).wrapping_sub(u32::from(SUBNET));
+    (1..=65534).contains(&host)
 }
 
 /// Proposes a mesh IP for a node.
@@ -123,6 +144,59 @@ pub fn peers_from_live_nodes(
     peers
 }
 
+/// Returns the live peers, plus the pending peers that are not live yet.
+/// Skips the own node, which can be in a join response.
+pub fn desired_peers(
+    live: Vec<MeshPeer>,
+    pending: Vec<MeshPeer>,
+    own_public_key: &str,
+) -> Vec<MeshPeer> {
+    let mut peers = live;
+    for peer in pending {
+        let known = peers.iter().any(|p| p.public_key == peer.public_key);
+        if !known && peer.public_key != own_public_key {
+            peers.push(peer);
+        }
+    }
+    peers
+}
+
+/// Peers that are not in gossip yet:
+/// on a seed, the node that just joined;
+/// on a joining node, the members from the join response.
+/// A peer is forgotten when it appears in gossip, or after `PENDING_TTL`.
+/// From then on, gossip alone decides, so a node that leaves is removed at once.
+#[derive(Default)]
+pub struct PendingPeers {
+    peers: Mutex<Vec<(MeshPeer, Instant)>>,
+    /// Wakes `sync_peers` after `add`.
+    changed: Notify,
+}
+
+impl PendingPeers {
+    pub fn add(&self, peers: Vec<MeshPeer>) {
+        let now = Instant::now();
+        {
+            let mut pending = self.peers.lock().unwrap();
+            for peer in peers {
+                pending.retain(|(p, _)| p.public_key != peer.public_key);
+                pending.push((peer, now));
+            }
+        }
+        self.changed.notify_one();
+    }
+
+    /// Forgets the expired peers and the peers in `live`, and returns the others.
+    pub fn current(&self, live: &[MeshPeer]) -> Vec<MeshPeer> {
+        let mut pending = self.peers.lock().unwrap();
+        pending.retain(|(peer, added)| {
+            let is_live = live.iter().any(|l| l.public_key == peer.public_key);
+            added.elapsed() < PENDING_TTL && !is_live
+        });
+        pending.iter().map(|(peer, _)| peer.clone()).collect()
+    }
+}
+
 /// Compares the configured peers with the desired peers.
 /// Returns the peers to add or update, and the public keys to remove.
 pub fn diff_peers<'a>(
@@ -144,12 +218,20 @@ pub fn diff_peers<'a>(
 /// The mesh interface of this node.
 pub struct Mesh {
     api: WGApi<Kernel>,
+    psk: Key,
+    public_key: String,
     peers: Vec<MeshPeer>,
 }
 
 impl Mesh {
     /// Creates and configures the mesh interface, with no peers.
-    pub fn create(private_key: &Key, mesh_ip: Ipv4Addr, port: u16) -> anyhow::Result<Mesh> {
+    /// `psk` is the pre-shared key for all peers, from the join token.
+    pub fn create(
+        private_key: &Key,
+        psk: &Key,
+        mesh_ip: Ipv4Addr,
+        port: u16,
+    ) -> anyhow::Result<Mesh> {
         let mut api = WGApi::<Kernel>::new(INTERFACE)?;
 
         // An interface left behind by a crashed agent is not a problem:
@@ -171,6 +253,8 @@ impl Mesh {
 
         Ok(Mesh {
             api,
+            psk: psk.clone(),
+            public_key: private_key.public_key().to_string(),
             peers: Vec::new(),
         })
     }
@@ -220,6 +304,7 @@ impl Mesh {
         let key = Key::try_from(peer.public_key.as_str())
             .map_err(|err| anyhow::anyhow!("bad public key: {err}"))?;
         let mut wg_peer = Peer::new(key);
+        wg_peer.preshared_key = Some(self.psk.clone());
         wg_peer.endpoint = Some(peer.endpoint);
         wg_peer.allowed_ips = vec![IpAddrMask::host(IpAddr::V4(peer.mesh_ip))];
         self.api.configure_peer(&wg_peer)?;
@@ -248,14 +333,16 @@ impl Mesh {
     }
 }
 
-/// Keeps the WireGuard peers equal to the live nodes.
-/// Updates on every change of the live set,
-/// and also every `RESYNC_INTERVAL` to retry failed changes.
+/// Keeps the WireGuard peers equal to the live nodes plus the pending peers.
+/// Updates on every change of the live set, on every new pending peer,
+/// and also every `RESYNC_INTERVAL` to retry failed changes and to drop expired pending peers.
 /// Returns when chitchat stops.
-pub async fn sync_peers(handle: &ChitchatHandle, mesh: &mut Mesh) {
+pub async fn sync_peers(handle: &ChitchatHandle, mesh: &mut Mesh, pending: &PendingPeers) {
     let mut watcher = handle.chitchat().lock().await.live_nodes_watcher();
     loop {
-        let peers = peers_from_live_nodes(&watcher.borrow_and_update(), handle.chitchat_id());
+        let live = peers_from_live_nodes(&watcher.borrow_and_update(), handle.chitchat_id());
+        let not_live = pending.current(&live);
+        let peers = desired_peers(live, not_live, &mesh.public_key);
         mesh.set_peers(peers);
         tokio::select! {
             changed = watcher.changed() => {
@@ -263,6 +350,9 @@ pub async fn sync_peers(handle: &ChitchatHandle, mesh: &mut Mesh) {
                     return;
                 }
             }
+            // Wakes up the loop on changes to pending peers
+            // from `handle_join` of the join server
+            _ = pending.changed.notified() => {}
             _ = tokio::time::sleep(RESYNC_INTERVAL) => {}
         }
     }

@@ -76,3 +76,61 @@ fn diff_of_equal_lists_is_empty() {
     assert!(to_configure.is_empty());
     assert!(to_remove.is_empty());
 }
+
+#[test]
+fn is_mesh_ip_accepts_hosts_only() {
+    assert!(is_mesh_ip(Ipv4Addr::new(10, 42, 0, 1)));
+    assert!(is_mesh_ip(Ipv4Addr::new(10, 42, 255, 254)));
+    assert!(!is_mesh_ip(Ipv4Addr::new(10, 42, 0, 0)));
+    assert!(!is_mesh_ip(Ipv4Addr::new(10, 42, 255, 255)));
+    assert!(!is_mesh_ip(Ipv4Addr::new(10, 43, 0, 1)));
+    assert!(!is_mesh_ip(Ipv4Addr::new(10, 41, 255, 254)));
+}
+
+#[test]
+fn desired_peers_adds_pending_peers_that_are_not_live() {
+    let live = vec![peer(KEY_NODE_1, [10, 42, 0, 1])];
+    let pending = vec![
+        // Also live, with other facts: the live facts win.
+        peer(KEY_NODE_1, [10, 42, 0, 9]),
+        peer(KEY_NODE_2, [10, 42, 0, 2]),
+    ];
+    let desired = desired_peers(live, pending, "own key");
+    assert_eq!(
+        desired,
+        vec![
+            peer(KEY_NODE_1, [10, 42, 0, 1]),
+            peer(KEY_NODE_2, [10, 42, 0, 2]),
+        ]
+    );
+}
+
+#[test]
+fn desired_peers_skips_own_node() {
+    let pending = vec![peer(KEY_NODE_1, [10, 42, 0, 1])];
+    assert!(desired_peers(Vec::new(), pending, KEY_NODE_1).is_empty());
+}
+
+#[test]
+fn pending_peers_replace_by_public_key() {
+    let pending = PendingPeers::default();
+    pending.add(vec![peer(KEY_NODE_1, [10, 42, 0, 1])]);
+    pending.add(vec![peer(KEY_NODE_1, [10, 42, 0, 2])]);
+    assert_eq!(pending.current(&[]), vec![peer(KEY_NODE_1, [10, 42, 0, 2])]);
+}
+
+#[test]
+fn pending_peers_are_forgotten_once_live() {
+    let pending = PendingPeers::default();
+    pending.add(vec![
+        peer(KEY_NODE_1, [10, 42, 0, 1]),
+        peer(KEY_NODE_2, [10, 42, 0, 2]),
+    ]);
+    let live = vec![peer(KEY_NODE_1, [10, 42, 0, 1])];
+    assert_eq!(
+        pending.current(&live),
+        vec![peer(KEY_NODE_2, [10, 42, 0, 2])]
+    );
+    // The node leaves gossip later: it must not come back from the pending list.
+    assert_eq!(pending.current(&[]), vec![peer(KEY_NODE_2, [10, 42, 0, 2])]);
+}

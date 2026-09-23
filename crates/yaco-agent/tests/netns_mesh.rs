@@ -1,4 +1,5 @@
-//! Runs `tests/netns/mesh.sh`: three agents in separate network namespaces.
+//! Runs `tests/netns/mesh.sh`: three agents in separate network namespaces
+//! join over the bootstrap tunnel and reach each other over the mesh.
 //! The script needs no root, but it needs some system tools,
 //! so the test is ignored by default:
 //!
