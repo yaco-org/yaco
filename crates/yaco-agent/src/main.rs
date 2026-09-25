@@ -1,4 +1,5 @@
-use std::net::SocketAddr;
+use std::io::IsTerminal;
+use std::net::{IpAddr, SocketAddr};
 use std::sync::Arc;
 
 use clap::Parser;
@@ -21,10 +22,9 @@ struct Args {
     #[arg(long, env = "YACO_TOKEN", hide_env_values = true)]
     token: String,
 
-    /// UDP address for gossip.
-    /// Its IP is also the public IP of both WireGuard endpoints.
-    #[arg(long, env = "YACO_LISTEN", default_value = "127.0.0.1:7280")]
-    listen: SocketAddr,
+    /// Public IP of this node, for both WireGuard endpoints.
+    #[arg(long, env = "YACO_PUBLIC_IP")]
+    public_ip: IpAddr,
 
     /// Public bootstrap address (IP and bootstrap port) of an existing node.
     /// Repeat for more seeds. Without seeds, the node starts a new cluster.
@@ -43,6 +43,8 @@ struct Args {
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
     tracing_subscriber::fmt()
+        // No color codes in files and in the journal.
+        .with_ansi(std::io::stdout().is_terminal())
         .with_env_filter(
             EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("info")),
         )
@@ -54,7 +56,7 @@ async fn main() -> anyhow::Result<()> {
     // A new key on every start. Storing it on disk is a later step.
     let private_key = Key::generate();
     let public_key = private_key.public_key().to_string();
-    let endpoint = SocketAddr::new(args.listen.ip(), args.wg_port);
+    let endpoint = SocketAddr::new(args.public_ip, args.wg_port);
     let boot = Bootstrap::create(args.boot_port)?;
     let pending = Arc::new(PendingPeers::default());
 
@@ -78,6 +80,7 @@ async fn main() -> anyhow::Result<()> {
         .await?;
         // The members are mesh peers before gossip has them.
         pending.add(response.members);
+        // The gossip seed is the mesh address of the seed.
         (own_facts, vec![response.gossip_seed])
     };
 
@@ -88,9 +91,18 @@ async fn main() -> anyhow::Result<()> {
         args.wg_port,
     )?;
 
+    // chitchat sends its first gossip to the seed over the mesh,
+    // so the peers from the join must be configured before it starts.
+    mesh.set_peers(mesh::desired_peers(
+        Vec::new(),
+        pending.current(&[]),
+        &own_facts.public_key,
+    ));
+
+    let gossip_addr = SocketAddr::new(IpAddr::V4(own_facts.mesh_ip), gossip::GOSSIP_PORT);
     let config = gossip::config(
         &args.node_id,
-        args.listen,
+        gossip_addr,
         &gossip_seeds,
         gossip::DEFAULT_GOSSIP_INTERVAL,
     );
@@ -107,7 +119,8 @@ async fn main() -> anyhow::Result<()> {
 
     tracing::info!(
         node_id = %args.node_id,
-        listen = %args.listen,
+        public_ip = %args.public_ip,
+        gossip = %gossip_addr,
         mesh_ip = %own_facts.mesh_ip,
         wg_endpoint = %own_facts.endpoint,
         boot_port = args.boot_port,

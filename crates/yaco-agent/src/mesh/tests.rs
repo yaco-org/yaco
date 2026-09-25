@@ -134,3 +134,19 @@ fn pending_peers_are_forgotten_once_live() {
     // The node leaves gossip later: it must not come back from the pending list.
     assert_eq!(pending.current(&[]), vec![peer(KEY_NODE_2, [10, 42, 0, 2])]);
 }
+
+fn chitchat_id(node_id: &str, generation: u64) -> ChitchatId {
+    ChitchatId::new(node_id, generation, "10.42.0.1:7280".parse().unwrap())
+}
+
+#[test]
+fn latest_generations_keeps_the_newest_generation_of_each_node() {
+    let old = chitchat_id("node-1", 100);
+    let new = chitchat_id("node-1", 200);
+    let other = chitchat_id("node-2", 50);
+    // The order of the input does not matter.
+    let latest = latest_generations([(&new, "new"), (&other, "other"), (&old, "old")]);
+    assert_eq!(latest.len(), 2);
+    assert_eq!(latest["node-1"], "new");
+    assert_eq!(latest["node-2"], "other");
+}

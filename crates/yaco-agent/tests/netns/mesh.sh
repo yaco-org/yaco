@@ -1,13 +1,17 @@
 #!/bin/sh
 # Starts three agents, each in its own network namespace.
 # n2 and n3 join through n1 over the bootstrap tunnel.
-# Checks that every node reaches every other node over the mesh,
-# and that a fourth node with a wrong join token cannot join.
+# Checks that:
+# - every node reaches every other node over the mesh,
+# - gossip listens on the mesh IP only,
+# - a node cut off for a while comes back without a restart,
+# - a graceful leave removes the peer,
+# - a fourth node with a wrong join token cannot join.
 #
 # The script runs itself in a new user namespace,
 # where it has CAP_NET_ADMIN over the namespaces that it creates.
 #
-# Needs: unshare (util-linux), ip (iproute2), ping,
+# Needs: unshare (util-linux), ip and ss (iproute2), ping,
 # and the WireGuard kernel module (Linux 5.6 or later has it).
 #
 # Environment:
@@ -70,19 +74,33 @@ for n in $NODES; do
     seed="--seed 10.99.0.1:7282"
   fi
   # shellcheck disable=SC2086
-  YACO_TOKEN=$TOKEN ip netns exec "n$n" "$AGENT" --node-id "n$n" --listen "10.99.0.$n:7280" $seed \
+  YACO_TOKEN=$TOKEN ip netns exec "n$n" "$AGENT" --node-id "n$n" --public-ip "10.99.0.$n" $seed \
     >"$LOG_DIR/n$n.log" 2>&1 &
   pids="$pids $!"
   last_pid=$!
 done
 
 # n4 has a wrong token. It runs in parallel and must give up.
-YACO_TOKEN=$WRONG_TOKEN ip netns exec n4 "$AGENT" --node-id n4 --listen 10.99.0.4:7280 \
+YACO_TOKEN=$WRONG_TOKEN ip netns exec n4 "$AGENT" --node-id n4 --public-ip 10.99.0.4 \
   --seed 10.99.0.1:7282 >"$LOG_DIR/n4.log" 2>&1 &
 intruder_pid=$!
 
 mesh_ip() {
   ip -n "$1" -4 -o addr show dev yaco-mesh 2>/dev/null | awk '{print $4}' | cut -d/ -f1
+}
+
+# Prints the node IDs of the last live set that node $1 logged.
+last_live_set() {
+  grep "membership changed" "$LOG_DIR/$1.log" | tail -n 1 | sed 's/.*live=//'
+}
+
+# Waits until node $1 logs a live set that equals $2, for example '["n1", "n2"]'.
+wait_for_live_set() {
+  deadline=$(($(date +%s) + $3))
+  until [ "$(last_live_set "$1")" = "$2" ]; do
+    [ "$(date +%s)" -lt "$deadline" ] || fail "$1 does not see the live set $2"
+    sleep 1
+  done
 }
 
 # Wait until every node reaches every other node.
@@ -111,6 +129,32 @@ case "$route" in
 *"dev yaco-mesh"*) echo "ok: n1 routes mesh traffic through yaco-mesh" ;;
 *) fail "unexpected route: $route" ;;
 esac
+
+# Gossip must listen on the mesh IP only, not on the public interface.
+for n in $NODES; do
+  sockets=$(ip netns exec "n$n" ss -Hlun "sport = :7280" | awk '{print $4}')
+  [ "$sockets" = "$(mesh_ip "n$n"):7280" ] || fail "n$n gossip sockets: $sockets"
+done
+echo "ok: gossip listens on the mesh IP only"
+
+# Cut n2 off until every node sees the split.
+# The nodes must keep the peers of dead nodes,
+# so that n2 comes back when the link is up again.
+# If they removed them, no path would be left for gossip between n2 and the others.
+wait_for_live_set n1 '["n1", "n2", "n3"]' 30
+ip link set yaco-test-v2 down
+wait_for_live_set n1 '["n1", "n3"]' 60
+wait_for_live_set n3 '["n1", "n3"]' 60
+wait_for_live_set n2 '["n2"]' 60
+echo "ok: all nodes see the split"
+ip link set yaco-test-v2 up
+wait_for_live_set n1 '["n1", "n2", "n3"]' 60
+wait_for_live_set n2 '["n1", "n2", "n3"]' 60
+ip netns exec n1 ping -c 1 -W 2 "$(mesh_ip n2)" >/dev/null || fail "n1 cannot reach n2 after the cut"
+if grep -q "removed mesh peer" "$LOG_DIR/n1.log" "$LOG_DIR/n2.log"; then
+  fail "a peer was removed during the cut"
+fi
+echo "ok: n2 came back after the cut"
 
 # A graceful leave of n3 must remove its peer on n1 and n2.
 # "ip netns exec" keeps the PID, so $last_pid is the agent of n3.

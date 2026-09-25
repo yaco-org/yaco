@@ -24,22 +24,24 @@ It must have at least 16 characters.
 Start the first node without seeds:
 
 ```sh
-YACO_TOKEN=<token> yaco-agent --node-id n1 --listen <public IP>:7280
+YACO_TOKEN=<token> yaco-agent --node-id n1 --public-ip <public IP>
 ```
 
 Start every other node with the public IP and bootstrap port of any existing node:
 
 ```sh
-YACO_TOKEN=<token> yaco-agent --node-id n2 --listen <public IP>:7280 --seed <IP of n1>:7282
+YACO_TOKEN=<token> yaco-agent --node-id n2 --public-ip <public IP> --seed <IP of n1>:7282
 ```
 
 Open these UDP ports on every node:
 
 | Port | Use                                              |
 | ---- | ------------------------------------------------ |
-| 7280 | Gossip (moves into the mesh in a later step)     |
 | 7281 | Mesh WireGuard interface                         |
 | 7282 | Bootstrap WireGuard interface, for joining nodes |
+
+Gossip (UDP 7280) runs inside the mesh, on the mesh IP only.
+Do not open it on the public interface.
 
 ## Tests
 

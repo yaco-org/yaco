@@ -1,4 +1,7 @@
 //! Membership and state replication with chitchat.
+//!
+//! The agent runs chitchat on its mesh IP only,
+//! so gossip is encrypted and only nodes with the join token take part.
 
 use std::net::SocketAddr;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
@@ -12,6 +15,9 @@ use chitchat::{
 pub const CLUSTER_ID: &str = "yaco";
 pub const DEFAULT_GOSSIP_INTERVAL: Duration = Duration::from_secs(1);
 
+/// UDP port of chitchat, on the mesh IP.
+pub const GOSSIP_PORT: u16 = 7280;
+
 /// A node sets this key just before it shuts down.
 /// Other nodes then remove it from the live set at once,
 /// instead of after the failure detector timeout.
@@ -20,6 +26,13 @@ pub const LEAVING_KEY: &str = "leaving";
 /// Gossip rounds to wait after setting `LEAVING_KEY`,
 /// so that the key reaches the other nodes.
 pub const LEAVE_ROUNDS: u32 = 3;
+
+/// How long to wait before chitchat removes a dead node.
+/// We wait so that nodes that got disconnected
+/// because of network issues can seamlessly join back.
+/// Once the node is deleted, it will have to be restarted
+/// to execute the regular join procedure again.
+pub const DEAD_NODE_GRACE_PERIOD: u64 = 24;
 
 /// Builds a chitchat config with the chitchat default values.
 ///
@@ -37,7 +50,10 @@ pub fn config(
         gossip_interval,
         listen_addr,
         seed_nodes: seeds.iter().map(|addr| addr.to_string()).collect(),
-        failure_detector_config: FailureDetectorConfig::default(),
+        failure_detector_config: FailureDetectorConfig {
+            dead_node_grace_period: Duration::from_hours(DEAD_NODE_GRACE_PERIOD),
+            ..FailureDetectorConfig::default()
+        },
         marked_for_deletion_grace_period: Duration::from_secs(60 * 60),
         catchup_callback: None,
         extra_liveness_predicate: Some(Box::new(|node_state| {

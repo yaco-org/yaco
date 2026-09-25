@@ -70,9 +70,9 @@ pub struct JoinRequest {
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct JoinResponse {
-    /// The seed and all live nodes that the seed knows.
+    /// The seed and all nodes that the seed knows, live or dead.
     pub members: Vec<MeshPeer>,
-    /// Gossip address of the seed.
+    /// Gossip address of the seed, inside the mesh.
     pub gossip_seed: SocketAddr,
 }
 
@@ -188,19 +188,27 @@ async fn handle_join(
     State(server): State<Arc<JoinServer>>,
     Json(request): Json<JoinRequest>,
 ) -> Result<Json<JoinResponse>, (StatusCode, String)> {
-    let (gossip_seed, live) = {
+    let (gossip_seed, nodes) = {
         let chitchat = server.chitchat.lock().await;
-        let live = chitchat.live_nodes_watcher().borrow().clone();
+        let nodes = chitchat.node_states().clone();
         let addr = chitchat.self_chitchat_id().gossip_advertise_addr;
-        (addr, live)
+        (addr, nodes)
     };
 
+    // All nodes that chitchat knows, dead ones included:
+    // a dead node can come back and still have its mesh IP.
+    let mut known = mesh::known_peers(&nodes);
+    known.remove(&*server.self_id.node_id);
+    // An earlier generation of the joining node gives its mesh IP free.
+    known.remove(&request.node_id);
     let mut members = vec![server.own.clone()];
-    members.extend(mesh::peers_from_live_nodes(&live, &server.self_id));
+    members.extend(known.into_values());
 
-    let mut known = members.clone();
-    known.extend(server.pending.current(&members));
-    match check_join(&request, &known) {
+    // Mesh IPs in use: the members and the nodes that joined but are not in gossip yet.
+    let mut taken = members.clone();
+    taken.extend(server.pending.current(&members));
+
+    match check_join(&request, &taken) {
         Ok(()) => {
             tracing::info!(node_id = %request.node_id, mesh_ip = %request.peer.mesh_ip, endpoint = %request.peer.endpoint, "accepted join");
             // Add the new node as a mesh peer now, not after gossip.
