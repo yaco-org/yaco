@@ -34,6 +34,9 @@ humantime-serde = "1"
 # Random jitter for join retries
 rand = "0.10"
 
+# Tests only
+tempfile = "3"
+
 # Cluster-scope clock
 uhlc = "0.9"
 

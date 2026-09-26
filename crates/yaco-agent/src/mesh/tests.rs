@@ -180,3 +180,94 @@ fn latest_generations_keeps_the_newest_generation_of_each_node() {
     assert_eq!(latest["node-1"], "new");
     assert_eq!(latest["node-2"], "other");
 }
+
+mod known_peers {
+    use super::*;
+    use crate::test_util::{chitchat_id, chitchat_with_nodes, key_values};
+
+    fn facts(public_key: &str, mesh_ip: [u8; 4]) -> Vec<(String, String)> {
+        peer(public_key, mesh_ip).to_facts()
+    }
+
+    #[test]
+    fn returns_every_node_with_valid_facts_self_included() {
+        let chitchat = chitchat_with_nodes(
+            &chitchat_id("node-1", 1),
+            facts(KEY_NODE_1, [10, 42, 0, 1]),
+            vec![(chitchat_id("node-2", 1), facts(KEY_NODE_2, [10, 42, 0, 2]))],
+        );
+        let known = known_peers(chitchat.node_states());
+        assert_eq!(known.len(), 2);
+        assert_eq!(known["node-1"], peer(KEY_NODE_1, [10, 42, 0, 1]));
+        assert_eq!(known["node-2"], peer(KEY_NODE_2, [10, 42, 0, 2]));
+    }
+
+    #[test]
+    fn skips_nodes_with_bad_or_missing_facts() {
+        let mut bad_ip = facts(KEY_NODE_2, [10, 42, 0, 2]);
+        bad_ip[1].1 = "not an ip".to_string();
+        let chitchat = chitchat_with_nodes(
+            &chitchat_id("node-1", 1),
+            facts(KEY_NODE_1, [10, 42, 0, 1]),
+            vec![
+                (chitchat_id("node-2", 1), bad_ip),
+                (chitchat_id("node-3", 1), key_values(&[("unrelated", "x")])),
+            ],
+        );
+        let known = known_peers(chitchat.node_states());
+        assert_eq!(known.keys().collect::<Vec<_>>(), vec!["node-1"]);
+    }
+
+    #[test]
+    fn skips_nodes_that_left() {
+        let mut leaving = facts(KEY_NODE_2, [10, 42, 0, 2]);
+        leaving.push((LEAVING_KEY.to_string(), "true".to_string()));
+        let chitchat = chitchat_with_nodes(
+            &chitchat_id("node-1", 1),
+            facts(KEY_NODE_1, [10, 42, 0, 1]),
+            vec![(chitchat_id("node-2", 1), leaving)],
+        );
+        assert!(!known_peers(chitchat.node_states()).contains_key("node-2"));
+    }
+
+    #[test]
+    fn takes_the_latest_generation_of_a_restarted_node() {
+        let chitchat = chitchat_with_nodes(
+            &chitchat_id("node-1", 1),
+            facts(KEY_NODE_1, [10, 42, 0, 1]),
+            vec![
+                // The node restarted with a new key.
+                (
+                    chitchat_id("node-2", 200),
+                    facts(KEY_NODE_2, [10, 42, 0, 2]),
+                ),
+                (
+                    chitchat_id("node-2", 100),
+                    facts(KEY_NODE_1, [10, 42, 0, 9]),
+                ),
+            ],
+        );
+        let known = known_peers(chitchat.node_states());
+        assert_eq!(known["node-2"], peer(KEY_NODE_2, [10, 42, 0, 2]));
+    }
+
+    #[test]
+    fn a_leaving_latest_generation_hides_the_older_ones() {
+        // The old generation crashed, the new one left gracefully:
+        // the old key must not come back as a peer.
+        let mut leaving = facts(KEY_NODE_2, [10, 42, 0, 2]);
+        leaving.push((LEAVING_KEY.to_string(), "true".to_string()));
+        let chitchat = chitchat_with_nodes(
+            &chitchat_id("node-1", 1),
+            facts(KEY_NODE_1, [10, 42, 0, 1]),
+            vec![
+                (
+                    chitchat_id("node-2", 100),
+                    facts(KEY_NODE_1, [10, 42, 0, 9]),
+                ),
+                (chitchat_id("node-2", 200), leaving),
+            ],
+        );
+        assert!(!known_peers(chitchat.node_states()).contains_key("node-2"));
+    }
+}

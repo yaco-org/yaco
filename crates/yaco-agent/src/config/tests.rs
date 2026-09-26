@@ -2,6 +2,8 @@
 
 use super::*;
 
+const EXAMPLE: &str = include_str!("../../../../yaco.example.toml");
+
 const MINIMAL: &str = r#"
 [node]
 id = "node-1"
@@ -31,7 +33,7 @@ fn minimal_file_gets_the_defaults() {
 
 #[test]
 fn example_file_is_valid_and_shows_the_defaults() {
-    let text = include_str!("../../../../yaco.example.toml");
+    let text = EXAMPLE;
     let config = Config::parse(text).unwrap();
     assert_eq!(config.cluster, ClusterConfig::default());
     assert_eq!(config.node.mesh_port, default_mesh_port());
@@ -165,4 +167,78 @@ mesh_port = 9001
 "#;
     let b = Config::parse(text).unwrap();
     assert_eq!(a.cluster.fingerprint(), b.cluster.fingerprint());
+}
+
+/// Collects the dotted paths of all keys in `value`, for example `cluster.mtu`.
+/// Arrays are values, so their items are not keys.
+fn key_paths(value: &toml::Value, prefix: &str, paths: &mut Vec<String>) {
+    if let toml::Value::Table(table) = value {
+        for (key, value) in table {
+            let path = if prefix.is_empty() {
+                key.clone()
+            } else {
+                format!("{prefix}.{key}")
+            };
+            key_paths(value, &path, paths);
+            if !value.is_table() {
+                paths.push(path);
+            }
+        }
+    }
+    paths.sort();
+}
+
+#[test]
+fn example_file_shows_every_config_key() {
+    // All keys that `Config` has, from a serialized config.
+    let config = toml::Value::try_from(Config::parse(MINIMAL).unwrap()).unwrap();
+    let mut expected = Vec::new();
+    key_paths(&config, "", &mut expected);
+
+    let example: toml::Value = toml::from_str(EXAMPLE).unwrap();
+    let mut shown = Vec::new();
+    key_paths(&example, "", &mut shown);
+
+    // Unknown keys in the example already fail `example_file_is_valid_and_shows_the_defaults`.
+    let missing: Vec<&String> = expected.iter().filter(|key| !shown.contains(key)).collect();
+    assert!(
+        missing.is_empty(),
+        "yaco.example.toml does not show these config keys: {missing:?}"
+    );
+}
+
+#[test]
+fn load_reads_the_file() {
+    let mut file = tempfile::NamedTempFile::new().unwrap();
+    std::io::Write::write_all(&mut file, MINIMAL.as_bytes()).unwrap();
+    let config = Config::load(file.path()).unwrap();
+    assert_eq!(config.node.id, "node-1");
+}
+
+#[test]
+fn load_errors_name_the_file() {
+    let missing = std::path::Path::new("/nonexistent/yaco.toml");
+    let err = Config::load(missing).unwrap_err();
+    assert!(
+        format!("{err:#}").contains("/nonexistent/yaco.toml"),
+        "{err:#}"
+    );
+
+    let mut file = tempfile::NamedTempFile::new().unwrap();
+    std::io::Write::write_all(&mut file, b"[node]\nid = 1\n").unwrap();
+    let err = Config::load(file.path()).unwrap_err();
+    let path = file.path().display().to_string();
+    assert!(format!("{err:#}").contains(&path), "{err:#}");
+}
+
+#[test]
+fn fingerprint_is_shown_as_64_lowercase_hex_characters() {
+    let shown = ClusterConfig::default().fingerprint().to_string();
+    assert_eq!(shown.len(), 64);
+    assert!(
+        shown
+            .chars()
+            .all(|c| c.is_ascii_digit() || ('a'..='f').contains(&c)),
+        "{shown}"
+    );
 }
