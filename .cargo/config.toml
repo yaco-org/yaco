@@ -1,0 +1,2 @@
+[alias]
+cov = "tarpaulin --out Html Json Markdown --output-dir target/coverage"
