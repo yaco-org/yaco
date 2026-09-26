@@ -21,26 +21,43 @@ Every node of a cluster has the same join token.
 You can make one with `openssl rand -base64 32`.
 It must have at least 16 characters.
 
-Start the first node without seeds:
+Every node has a config file, by default `/etc/yaco/yaco.toml` (change it with `--config` or `YACO_CONFIG`).
+`yaco.example.toml` shows every value with its default.
+Only `node.id` and `node.public_ip` are required.
+The token is not in the config file and should be supplied with `YACO_TOKEN`.
 
-```sh
-YACO_TOKEN=<token> yaco-agent --node-id n1 --public-ip <public IP>
+The `[cluster]` table must be the same on every node.
+A joining node sends a fingerprint of it, and a seed with another `[cluster]` table refuses the join.
+
+The first node has no seeds:
+
+```toml
+[node]
+id = "n1"
+public_ip = "203.0.113.1"
 ```
 
-Start every other node with the public IP and bootstrap port of any existing node:
+Every other node has the public IP and bootstrap port of any existing node:
 
-```sh
-YACO_TOKEN=<token> yaco-agent --node-id n2 --public-ip <public IP> --seed <IP of n1>:7282
+```toml
+[node]
+id = "n2"
+public_ip = "203.0.113.2"
+seeds = ["203.0.113.1:7282"]
 ```
 
-Open these UDP ports on every node:
+```sh
+YACO_TOKEN=<token> yaco-agent --config /etc/yaco/yaco.toml
+```
 
-| Port | Use                                              |
-| ---- | ------------------------------------------------ |
-| 7281 | Mesh WireGuard interface                         |
-| 7282 | Bootstrap WireGuard interface, for joining nodes |
+Open these UDP ports on every node (the defaults are shown):
 
-Gossip (UDP 7280) runs inside the mesh, on the mesh IP only.
+| Port | Config key       | Use                                              |
+| ---- | ---------------- | ------------------------------------------------ |
+| 7281 | `node.mesh_port` | Mesh WireGuard interface                         |
+| 7282 | `node.boot_port` | Bootstrap WireGuard interface, for joining nodes |
+
+Gossip (`cluster.gossip_port`, UDP 7280) runs inside the mesh, on the mesh IP only.
 Do not open it on the public interface.
 
 ## Tests

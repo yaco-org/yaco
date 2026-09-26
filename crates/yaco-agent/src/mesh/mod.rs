@@ -30,35 +30,18 @@ use defguard_wireguard_rs::key::Key;
 use defguard_wireguard_rs::net::IpAddrMask;
 use defguard_wireguard_rs::peer::Peer;
 use defguard_wireguard_rs::{InterfaceConfiguration, Kernel, WGApi, WireguardInterfaceApi};
+use ipnet::Ipv4Net;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use tokio::sync::Notify;
 
+use crate::config::Config;
 use crate::gossip::LEAVING_KEY;
-
-/// Name of the main mesh interface.
-/// The `yaco-` prefix keeps it apart from interfaces of other tools,
-/// for example `wg0` of wg-quick.
-/// Linux limits interface names to 15 characters.
-pub const INTERFACE: &str = "yaco-mesh";
-
-/// Mesh subnet: 10.42.0.0/16.
-pub const SUBNET: Ipv4Addr = Ipv4Addr::new(10, 42, 0, 0);
-pub const SUBNET_PREFIX_LEN: u8 = 16;
-
-/// Interface MTU.
-pub const MTU: u32 = 1420;
 
 /// Fact keys in the own chitchat namespace.
 pub const WG_PUBLIC_KEY_KEY: &str = "facts/wg_public_key";
 pub const MESH_IP_KEY: &str = "facts/mesh_ip";
 pub const ENDPOINT_KEY: &str = "facts/endpoint";
-
-/// How often `sync_peers` retries without a membership change.
-pub const RESYNC_INTERVAL: Duration = Duration::from_secs(30);
-
-/// How long a pending peer stays configured without appearing in gossip.
-pub const PENDING_TTL: Duration = Duration::from_secs(60);
 
 /// One remote node, as the WireGuard peer list needs it.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -110,25 +93,27 @@ pub fn check_public_key(public_key: &str) -> anyhow::Result<()> {
     Ok(())
 }
 
-/// Returns true if `ip` is a host address in the mesh subnet.
-pub fn is_mesh_ip(ip: Ipv4Addr) -> bool {
-    let host = u32::from(ip).wrapping_sub(u32::from(SUBNET));
-    (1..=65534).contains(&host)
+/// Returns true if `ip` is a host address in `subnet`:
+/// in the subnet, and neither the subnet address nor the broadcast address.
+pub fn is_mesh_ip(subnet: Ipv4Net, ip: Ipv4Addr) -> bool {
+    subnet.contains(&ip) && ip != subnet.network() && ip != subnet.broadcast()
 }
 
-/// Proposes a mesh IP for a node.
+/// Proposes a mesh IP for a node, in `subnet`.
 ///
 /// SHA-256 keeps the result stable across versions and platforms.
-/// The host part is in 1..=65534,
-/// so the result is never the subnet address or the broadcast address.
-pub fn mesh_ip(node_id: &str, attempt: u32) -> Ipv4Addr {
+/// The result is a host address: never the subnet address or the broadcast address.
+/// `subnet` must be a /30 or larger, as `Config` makes sure.
+pub fn mesh_ip(subnet: Ipv4Net, node_id: &str, attempt: u32) -> Ipv4Addr {
     let mut hasher = Sha256::new();
     hasher.update(node_id.as_bytes());
     hasher.update(attempt.to_be_bytes());
     let hash = hasher.finalize();
     let value = u32::from_be_bytes([hash[0], hash[1], hash[2], hash[3]]);
-    let host = 1 + value % 65534;
-    Ipv4Addr::from(u32::from(SUBNET) + host)
+    // All addresses of the subnet, minus the subnet address and the broadcast address.
+    let host_count = (1u64 << (32 - subnet.prefix_len())) - 2;
+    let host = 1 + u64::from(value) % host_count;
+    Ipv4Addr::from(u32::from(subnet.network()) + host as u32)
 }
 
 /// Keeps only the latest generation of every node ID.
@@ -197,16 +182,24 @@ pub fn desired_peers(
 /// Peers that are not in gossip yet:
 /// on a seed, the node that just joined;
 /// on a joining node, the members from the join response.
-/// A peer is forgotten when it appears in gossip, or after `PENDING_TTL`.
+/// A peer is forgotten when it appears in gossip, or after `ttl`.
 /// From then on, gossip alone decides, so a node that leaves is removed at once.
-#[derive(Default)]
 pub struct PendingPeers {
     peers: Mutex<Vec<(MeshPeer, Instant)>>,
+    ttl: Duration,
     /// Wakes `sync_peers` after `add`.
     changed: Notify,
 }
 
 impl PendingPeers {
+    pub fn new(ttl: Duration) -> PendingPeers {
+        PendingPeers {
+            peers: Mutex::new(Vec::new()),
+            ttl,
+            changed: Notify::new(),
+        }
+    }
+
     pub fn add(&self, peers: Vec<MeshPeer>) {
         let now = Instant::now();
         {
@@ -224,7 +217,7 @@ impl PendingPeers {
         let mut pending = self.peers.lock().unwrap();
         pending.retain(|(peer, added)| {
             let is_known = known.iter().any(|k| k.public_key == peer.public_key);
-            added.elapsed() < PENDING_TTL && !is_known
+            added.elapsed() < self.ttl && !is_known
         });
         pending.iter().map(|(peer, _)| peer.clone()).collect()
     }
@@ -251,6 +244,7 @@ pub fn diff_peers<'a>(
 /// The mesh interface of this node.
 pub struct Mesh {
     api: WGApi<Kernel>,
+    interface: String,
     psk: Key,
     public_key: String,
     peers: Vec<MeshPeer>,
@@ -260,32 +254,37 @@ impl Mesh {
     /// Creates and configures the mesh interface, with no peers.
     /// `psk` is the pre-shared key for all peers, from the join token.
     pub fn create(
+        config: &Config,
         private_key: &Key,
         psk: &Key,
         mesh_ip: Ipv4Addr,
-        port: u16,
     ) -> anyhow::Result<Mesh> {
-        let mut api = WGApi::<Kernel>::new(INTERFACE)?;
+        let interface = config.node.mesh_interface.clone();
+        let mut api = WGApi::<Kernel>::new(interface.clone())?;
 
         // An interface left behind by a crashed agent is not a problem:
         // `create_interface` reuses an existing interface,
         // and `configure_interface` replaces its addresses, key and peers.
         api.create_interface()
-            .with_context(|| format!("cannot create interface {INTERFACE}"))?;
+            .with_context(|| format!("cannot create interface {interface}"))?;
         api.configure_interface(&InterfaceConfiguration {
-            name: INTERFACE.to_string(),
+            name: interface.clone(),
             prvkey: private_key.to_string(),
-            // The /16 prefix makes the kernel route the whole subnet into the interface.
-            addresses: vec![IpAddrMask::new(IpAddr::V4(mesh_ip), SUBNET_PREFIX_LEN)],
-            port,
+            // The subnet prefix makes the kernel route the whole subnet into the interface.
+            addresses: vec![IpAddrMask::new(
+                IpAddr::V4(mesh_ip),
+                config.cluster.mesh_subnet.prefix_len(),
+            )],
+            port: config.node.mesh_port,
             peers: Vec::new(),
-            mtu: Some(MTU),
+            mtu: Some(config.cluster.mtu),
             fwmark: None,
         })
-        .with_context(|| format!("cannot configure interface {INTERFACE}"))?;
+        .with_context(|| format!("cannot configure interface {interface}"))?;
 
         Ok(Mesh {
             api,
+            interface,
             psk: psk.clone(),
             public_key: private_key.public_key().to_string(),
             peers: Vec::new(),
@@ -360,18 +359,23 @@ impl Mesh {
     /// Then the kernel interface stays.
     pub fn remove(self) {
         match self.api.remove_interface() {
-            Ok(()) => tracing::info!("removed interface {INTERFACE}"),
-            Err(err) => tracing::warn!("cannot remove interface {INTERFACE}: {err}"),
+            Ok(()) => tracing::info!("removed interface {}", self.interface),
+            Err(err) => tracing::warn!("cannot remove interface {}: {err}", self.interface),
         }
     }
 }
 
 /// Keeps the WireGuard peers equal to the known nodes plus the pending peers.
 /// Updates on every change of the live set, on every new pending peer,
-/// and also every `RESYNC_INTERVAL`: to retry failed changes,
+/// and also every `resync_interval`: to retry failed changes,
 /// to drop expired pending peers, and to drop dead nodes that chitchat forgot.
 /// Returns when chitchat stops.
-pub async fn sync_peers(handle: &ChitchatHandle, mesh: &mut Mesh, pending: &PendingPeers) {
+pub async fn sync_peers(
+    handle: &ChitchatHandle,
+    mesh: &mut Mesh,
+    pending: &PendingPeers,
+    resync_interval: Duration,
+) {
     let own_node_id = handle.chitchat_id().node_id.to_string();
     let mut watcher = handle.chitchat().lock().await.live_nodes_watcher();
     loop {
@@ -393,7 +397,7 @@ pub async fn sync_peers(handle: &ChitchatHandle, mesh: &mut Mesh, pending: &Pend
             // Wakes up the loop on changes to pending peers
             // from `handle_join` of the join server
             _ = pending.changed.notified() => {}
-            _ = tokio::time::sleep(RESYNC_INTERVAL) => {}
+            _ = tokio::time::sleep(resync_interval) => {}
         }
     }
 }

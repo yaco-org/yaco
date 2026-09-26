@@ -1,6 +1,6 @@
 //! Secure join through a bootstrap WireGuard tunnel.
 //!
-//! Every node has one bootstrap interface, `yaco-boot`, in one of two roles:
+//! Every node has one bootstrap interface (`node.boot_interface`) in one of two roles:
 //!
 //! - Server role, on every member:
 //!   the key is `boot_server` from the join token,
@@ -17,7 +17,6 @@ mod tests;
 
 use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 use std::sync::Arc;
-use std::time::Duration;
 
 use anyhow::Context;
 use axum::extract::State;
@@ -32,38 +31,16 @@ use defguard_wireguard_rs::{InterfaceConfiguration, Kernel, WGApi, WireguardInte
 use serde::{Deserialize, Serialize};
 use tokio::sync::Mutex;
 
+use crate::config::{ClusterConfig, Config, ConfigFingerprint};
 use crate::keys::ClusterKeys;
 use crate::mesh::{self, MeshPeer, PendingPeers};
-
-/// Name of the bootstrap interface.
-pub const INTERFACE: &str = "yaco-boot";
-
-/// Addresses inside the bootstrap tunnel.
-/// They are link-local (169.254.0.0/16), so they are never routed,
-/// and they do not overlap the mesh subnet or the Docker address pools.
-/// Every member has the same server address.
-/// Because each member has its own tunnel to the joining node
-/// this should not conflict.
-pub const SERVER_IP: Ipv4Addr = Ipv4Addr::new(169, 254, 42, 1);
-pub const CLIENT_IP: Ipv4Addr = Ipv4Addr::new(169, 254, 42, 2);
-/// The /30 prefix gives only two usable IPs (above).
-pub const PREFIX_LEN: u8 = 30;
-
-/// TCP port of the join endpoint, inside the tunnel.
-pub const HTTP_PORT: u16 = 7283;
-
-/// Timeout for one join request, WireGuard handshake included.
-pub const REQUEST_TIMEOUT: Duration = Duration::from_secs(5);
-/// How often the joining node tries all seeds before it gives up.
-pub const JOIN_ROUNDS: u32 = 5;
-/// Pause between two rounds.
-pub const RETRY_DELAY: Duration = Duration::from_secs(1);
-/// How many mesh IPs the joining node proposes before it gives up.
-pub const MAX_IP_ATTEMPTS: u32 = 16;
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct JoinRequest {
     pub node_id: String,
+    /// `[cluster]` config fingerprint of the joining node.
+    /// The seed refuses the join if it differs from its own.
+    pub config_fingerprint: ConfigFingerprint,
     /// The main WireGuard key, the proposed mesh IP and the public endpoint.
     pub peer: MeshPeer,
 }
@@ -80,19 +57,28 @@ pub struct JoinResponse {
 pub enum JoinRefusal {
     /// The request is malformed. HTTP 400.
     BadRequest(String),
+    /// The `[cluster]` config of the joining node differs from the seed's. HTTP 400.
+    ConfigMismatch,
     /// Another node has the proposed mesh IP. HTTP 409.
     MeshIpInUse,
 }
 
-/// Checks a join request against the known members.
+/// Checks a join request against the config and the known members of the seed.
 /// `members` must include the seed itself and the pending peers.
-pub fn check_join(request: &JoinRequest, members: &[MeshPeer]) -> Result<(), JoinRefusal> {
+pub fn check_join(
+    request: &JoinRequest,
+    cluster: &ClusterConfig,
+    members: &[MeshPeer],
+) -> Result<(), JoinRefusal> {
+    if request.config_fingerprint != cluster.fingerprint() {
+        return Err(JoinRefusal::ConfigMismatch);
+    }
     if request.node_id.is_empty() {
         return Err(JoinRefusal::BadRequest("empty node_id".to_string()));
     }
     mesh::check_public_key(&request.peer.public_key)
         .map_err(|err| JoinRefusal::BadRequest(err.to_string()))?;
-    if !mesh::is_mesh_ip(request.peer.mesh_ip) {
+    if !mesh::is_mesh_ip(cluster.mesh_subnet, request.peer.mesh_ip) {
         return Err(JoinRefusal::BadRequest(format!(
             "{} is not in the mesh subnet",
             request.peer.mesh_ip
@@ -111,52 +97,65 @@ pub fn check_join(request: &JoinRequest, members: &[MeshPeer]) -> Result<(), Joi
 /// The bootstrap interface of this node.
 pub struct Bootstrap {
     api: WGApi<Kernel>,
+    interface: String,
     port: u16,
+    cluster: ClusterConfig,
 }
 
 impl Bootstrap {
     /// Creates the bootstrap interface, or reuses a leftover one.
     /// Call `set_client` or `set_server` next.
-    pub fn create(port: u16) -> anyhow::Result<Bootstrap> {
-        let mut api = WGApi::<Kernel>::new(INTERFACE)?;
+    pub fn create(config: &Config) -> anyhow::Result<Bootstrap> {
+        let interface = config.node.boot_interface.clone();
+        let mut api = WGApi::<Kernel>::new(interface.clone())?;
         api.create_interface()
-            .with_context(|| format!("cannot create interface {INTERFACE}"))?;
-        Ok(Bootstrap { api, port })
+            .with_context(|| format!("cannot create interface {interface}"))?;
+        Ok(Bootstrap {
+            api,
+            interface,
+            port: config.node.boot_port,
+            cluster: config.cluster.clone(),
+        })
     }
 
     /// Client role: the only peer is the seed at `seed`.
     pub fn set_client(&self, keys: &ClusterKeys, seed: SocketAddr) -> anyhow::Result<()> {
         let mut server = Peer::new(keys.boot_server.public_key());
         server.endpoint = Some(seed);
-        server.allowed_ips = vec![IpAddrMask::host(IpAddr::V4(SERVER_IP))];
-        self.configure(&keys.boot_client, CLIENT_IP, server)
+        server.allowed_ips = vec![IpAddrMask::host(IpAddr::V4(self.cluster.boot_server_ip()))];
+        self.configure(&keys.boot_client, self.cluster.boot_client_ip(), server)
     }
 
     /// Server role: the only peer is any joining node.
     pub fn set_server(&self, keys: &ClusterKeys) -> anyhow::Result<()> {
         let mut client = Peer::new(keys.boot_client.public_key());
-        client.allowed_ips = vec![IpAddrMask::host(IpAddr::V4(CLIENT_IP))];
-        self.configure(&keys.boot_server, SERVER_IP, client)
+        client.allowed_ips = vec![IpAddrMask::host(IpAddr::V4(self.cluster.boot_client_ip()))];
+        self.configure(&keys.boot_server, self.cluster.boot_server_ip(), client)
     }
 
     /// Replaces the key, the address and the peers of the interface.
     fn configure(&self, private_key: &Key, ip: Ipv4Addr, peer: Peer) -> anyhow::Result<()> {
         self.api
             .configure_interface(&InterfaceConfiguration {
-                name: INTERFACE.to_string(),
+                name: self.interface.clone(),
                 prvkey: private_key.to_string(),
-                addresses: vec![IpAddrMask::new(IpAddr::V4(ip), PREFIX_LEN)],
+                // The subnet prefix gives the kernel a route to the other end of the tunnel.
+                addresses: vec![IpAddrMask::new(
+                    IpAddr::V4(ip),
+                    self.cluster.boot_subnet.prefix_len(),
+                )],
                 port: self.port,
                 peers: vec![peer],
-                mtu: Some(mesh::MTU),
+                mtu: Some(self.cluster.mtu),
                 fwmark: None,
             })
-            .with_context(|| format!("cannot configure interface {INTERFACE}"))
+            .with_context(|| format!("cannot configure interface {}", self.interface))
     }
 }
 
 /// Shared state of the join endpoint.
 pub struct JoinServer {
+    pub config: Config,
     pub chitchat: Arc<Mutex<Chitchat>>,
     pub self_id: ChitchatId,
     /// Facts of this node.
@@ -168,12 +167,16 @@ pub struct JoinServer {
 /// Call it after `Bootstrap::set_server`, when the server address exists.
 pub async fn serve(server: JoinServer) -> anyhow::Result<()> {
     let socket = tokio::net::TcpSocket::new_v4()?;
-    // Without this, the kernel also accepts connections to SERVER_IP
+    // Without this, the kernel also accepts connections to the server address
     // that arrive on another interface, outside the tunnel.
-    socket.bind_device(Some(INTERFACE.as_bytes()))?;
+    socket.bind_device(Some(server.config.node.boot_interface.as_bytes()))?;
     socket.set_reuseaddr(true)?;
+    let cluster = &server.config.cluster;
     socket
-        .bind(SocketAddr::new(IpAddr::V4(SERVER_IP), HTTP_PORT))
+        .bind(SocketAddr::new(
+            IpAddr::V4(cluster.boot_server_ip()),
+            cluster.join_port,
+        ))
         .context("cannot bind the join endpoint")?;
     let listener = socket.listen(16)?;
 
@@ -208,7 +211,7 @@ async fn handle_join(
     let mut taken = members.clone();
     taken.extend(server.pending.current(&members));
 
-    match check_join(&request, &taken) {
+    match check_join(&request, &server.config.cluster, &taken) {
         Ok(()) => {
             tracing::info!(node_id = %request.node_id, mesh_ip = %request.peer.mesh_ip, endpoint = %request.peer.endpoint, "accepted join");
             // Add the new node as a mesh peer now, not after gossip.
@@ -217,6 +220,15 @@ async fn handle_join(
                 members,
                 gossip_seed,
             }))
+        }
+        Err(JoinRefusal::ConfigMismatch) => {
+            let reason = format!(
+                "the [cluster] config differs: the seed has fingerprint {}, the joining node has fingerprint {}",
+                server.config.cluster.fingerprint(),
+                request.config_fingerprint
+            );
+            tracing::warn!(node_id = %request.node_id, "refused join: {reason}");
+            Err((StatusCode::BAD_REQUEST, reason))
         }
         Err(JoinRefusal::BadRequest(reason)) => {
             tracing::warn!(node_id = %request.node_id, "refused join: {reason}");
@@ -229,41 +241,48 @@ async fn handle_join(
     }
 }
 
-/// Joins the cluster through one of `seeds`.
+/// Joins the cluster through one of the seeds in `node.seeds`.
 ///
-/// `seeds` are public bootstrap endpoints (IP and bootstrap port) of members.
-/// Proposes `mesh_ip(node_id, attempt)` and takes the next attempt on HTTP 409.
+/// The seeds are public bootstrap endpoints (IP and bootstrap port) of members.
+/// Proposes `mesh_ip(mesh_subnet, node.id, attempt)` and takes the next attempt on HTTP 409.
 /// Returns the accepted facts of this node and the join response.
 pub async fn join(
     boot: &Bootstrap,
     keys: &ClusterKeys,
-    seeds: &[SocketAddr],
-    node_id: &str,
+    config: &Config,
     public_key: &str,
     endpoint: SocketAddr,
 ) -> anyhow::Result<(MeshPeer, JoinResponse)> {
+    let cluster = &config.cluster;
+    let node_id = &config.node.id;
+    let config_fingerprint = cluster.fingerprint();
     let client = reqwest::Client::builder()
-        .timeout(REQUEST_TIMEOUT)
+        .timeout(cluster.join_request_timeout)
         // So that we don't proxy join requests through an unrelated proxy.
         .no_proxy()
         .build()?;
-    let url = format!("http://{SERVER_IP}:{HTTP_PORT}/join");
+    let url = format!(
+        "http://{}:{}/join",
+        cluster.boot_server_ip(),
+        cluster.join_port
+    );
 
-    for round in 0..JOIN_ROUNDS {
+    for round in 0..cluster.join_rounds {
         if round > 0 {
-            tokio::time::sleep(RETRY_DELAY).await;
+            tokio::time::sleep(cluster.join_retry_delay).await;
         }
-        for &seed in seeds {
+        for &seed in &config.node.seeds {
             boot.set_client(keys, seed)?;
             let mut attempt = 0;
-            while attempt < MAX_IP_ATTEMPTS {
+            while attempt < cluster.max_mesh_ip_attempts {
                 let peer = MeshPeer {
                     public_key: public_key.to_string(),
-                    mesh_ip: mesh::mesh_ip(node_id, attempt),
+                    mesh_ip: mesh::mesh_ip(cluster.mesh_subnet, node_id, attempt),
                     endpoint,
                 };
                 let request = JoinRequest {
-                    node_id: node_id.to_string(),
+                    node_id: node_id.clone(),
+                    config_fingerprint: config_fingerprint.clone(),
                     peer: peer.clone(),
                 };
                 let result = client.post(&url).json(&request).send().await;

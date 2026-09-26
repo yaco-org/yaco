@@ -14,9 +14,19 @@ fn peer(public_key: &str, mesh_ip: [u8; 4]) -> MeshPeer {
     }
 }
 
+/// The mesh subnet is set here, not taken from the default of the config,
+/// so a change of the default does not break the tests.
+fn cluster() -> ClusterConfig {
+    ClusterConfig {
+        mesh_subnet: "10.42.0.0/16".parse().unwrap(),
+        ..ClusterConfig::default()
+    }
+}
+
 fn request(public_key: &str, mesh_ip: [u8; 4]) -> JoinRequest {
     JoinRequest {
         node_id: "node-2".to_string(),
+        config_fingerprint: cluster().fingerprint(),
         peer: peer(public_key, mesh_ip),
     }
 }
@@ -25,7 +35,7 @@ fn request(public_key: &str, mesh_ip: [u8; 4]) -> JoinRequest {
 fn free_mesh_ip_is_accepted() {
     let members = vec![peer(KEY_NODE_1, [10, 42, 0, 1])];
     assert_eq!(
-        check_join(&request(KEY_NODE_2, [10, 42, 0, 2]), &members),
+        check_join(&request(KEY_NODE_2, [10, 42, 0, 2]), &cluster(), &members),
         Ok(())
     );
 }
@@ -34,7 +44,7 @@ fn free_mesh_ip_is_accepted() {
 fn used_mesh_ip_is_a_conflict() {
     let members = vec![peer(KEY_NODE_1, [10, 42, 0, 1])];
     assert_eq!(
-        check_join(&request(KEY_NODE_2, [10, 42, 0, 1]), &members),
+        check_join(&request(KEY_NODE_2, [10, 42, 0, 1]), &cluster(), &members),
         Err(JoinRefusal::MeshIpInUse)
     );
 }
@@ -43,14 +53,19 @@ fn used_mesh_ip_is_a_conflict() {
 fn retried_join_of_the_same_node_is_accepted() {
     let members = vec![peer(KEY_NODE_2, [10, 42, 0, 2])];
     assert_eq!(
-        check_join(&request(KEY_NODE_2, [10, 42, 0, 2]), &members),
+        check_join(&request(KEY_NODE_2, [10, 42, 0, 2]), &cluster(), &members),
         Ok(())
     );
 }
 
 #[test]
 fn malformed_requests_are_refused() {
-    let bad = |r: JoinRequest| matches!(check_join(&r, &[]), Err(JoinRefusal::BadRequest(_)));
+    let bad = |r: JoinRequest| {
+        matches!(
+            check_join(&r, &cluster(), &[]),
+            Err(JoinRefusal::BadRequest(_))
+        )
+    };
 
     let mut empty_id = request(KEY_NODE_2, [10, 42, 0, 2]);
     empty_id.node_id.clear();
@@ -58,6 +73,32 @@ fn malformed_requests_are_refused() {
     assert!(bad(request("not a key", [10, 42, 0, 2])));
     assert!(bad(request(KEY_NODE_2, [192, 0, 2, 1])));
     assert!(bad(request(KEY_NODE_2, [10, 42, 0, 0])));
+}
+
+#[test]
+fn other_cluster_config_is_refused() {
+    let mut other = cluster();
+    other.gossip_interval *= 2;
+    let mut request = request(KEY_NODE_2, [10, 42, 0, 2]);
+    request.config_fingerprint = other.fingerprint();
+    assert_eq!(
+        check_join(&request, &cluster(), &[]),
+        Err(JoinRefusal::ConfigMismatch)
+    );
+}
+
+#[test]
+fn mesh_ip_outside_the_configured_subnet_is_refused() {
+    let small = ClusterConfig {
+        mesh_subnet: "10.42.0.0/24".parse().unwrap(),
+        ..cluster()
+    };
+    let mut request = request(KEY_NODE_2, [10, 42, 1, 2]);
+    request.config_fingerprint = small.fingerprint();
+    assert!(matches!(
+        check_join(&request, &small, &[]),
+        Err(JoinRefusal::BadRequest(_))
+    ));
 }
 
 #[test]

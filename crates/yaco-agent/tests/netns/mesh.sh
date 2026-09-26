@@ -6,7 +6,8 @@
 # - gossip listens on the mesh IP only,
 # - a node cut off for a while comes back without a restart,
 # - a graceful leave removes the peer,
-# - a fourth node with a wrong join token cannot join.
+# - a node with a wrong join token cannot join (n4),
+# - a node with another [cluster] config cannot join (n5).
 #
 # The script runs itself in a new user namespace,
 # where it has CAP_NET_ADMIN over the namespaces that it creates.
@@ -30,6 +31,12 @@ NODES="1 2 3"
 TOKEN="netns-test-token-0123456789"
 WRONG_TOKEN="netns-test-token-wrong-9876"
 
+# The script writes these values into the config files and checks them later,
+# so the test does not depend on the defaults of the agent.
+GOSSIP_PORT=7280
+BOOT_PORT=7282
+MESH_INTERFACE=yaco-test-mesh
+
 pids=""
 cleanup() {
   for pid in $pids; do
@@ -41,7 +48,7 @@ trap cleanup EXIT
 
 fail() {
   echo "FAIL: $*"
-  for n in $NODES 4; do
+  for n in $NODES 4 5; do
     echo "--- log of n$n"
     cat "$LOG_DIR/n$n.log" 2>/dev/null || true
   done
@@ -57,7 +64,7 @@ mkdir -p /run/netns
 ip link set lo up
 ip link add yaco-test-br type bridge
 ip link set yaco-test-br up
-for n in $NODES 4; do
+for n in $NODES 4 5; do
   ip netns add "n$n"
   ip link add "yaco-test-v$n" type veth peer name eth0 netns "n$n"
   ip link set "yaco-test-v$n" master yaco-test-br up
@@ -66,27 +73,50 @@ for n in $NODES 4; do
   ip -n "n$n" link set eth0 up
 done
 
+# Writes the config file of node n$1 to $LOG_DIR/n$1.toml.
+# $2 is the seed list, $3 is extra lines for the [cluster] table.
+write_config() {
+  cat >"$LOG_DIR/n$1.toml" <<EOF
+[node]
+id = "n$1"
+public_ip = "10.99.0.$1"
+seeds = [$2]
+boot_port = $BOOT_PORT
+mesh_interface = "$MESH_INTERFACE"
+
+[cluster]
+gossip_port = $GOSSIP_PORT
+$3
+EOF
+}
+
 # Start the agents. Node n1 starts the cluster, the others join through it.
 # The seed address is the public bootstrap endpoint of n1.
 for n in $NODES; do
-  seed=""
+  seeds=""
   if [ "$n" != 1 ]; then
-    seed="--seed 10.99.0.1:7282"
+    seeds="\"10.99.0.1:$BOOT_PORT\""
   fi
-  # shellcheck disable=SC2086
-  YACO_TOKEN=$TOKEN ip netns exec "n$n" "$AGENT" --node-id "n$n" --public-ip "10.99.0.$n" $seed \
+  write_config "$n" "$seeds" ""
+  YACO_TOKEN=$TOKEN ip netns exec "n$n" "$AGENT" --config "$LOG_DIR/n$n.toml" \
     >"$LOG_DIR/n$n.log" 2>&1 &
   pids="$pids $!"
   last_pid=$!
 done
 
-# n4 has a wrong token. It runs in parallel and must give up.
-YACO_TOKEN=$WRONG_TOKEN ip netns exec n4 "$AGENT" --node-id n4 --public-ip 10.99.0.4 \
-  --seed 10.99.0.1:7282 >"$LOG_DIR/n4.log" 2>&1 &
+# n4 has a wrong token, n5 has another [cluster] config.
+# They run in parallel and must give up.
+write_config 4 "\"10.99.0.1:$BOOT_PORT\"" ""
+YACO_TOKEN=$WRONG_TOKEN ip netns exec n4 "$AGENT" --config "$LOG_DIR/n4.toml" \
+  >"$LOG_DIR/n4.log" 2>&1 &
 intruder_pid=$!
+write_config 5 "\"10.99.0.1:$BOOT_PORT\"" 'gossip_interval = "2s"'
+YACO_TOKEN=$TOKEN ip netns exec n5 "$AGENT" --config "$LOG_DIR/n5.toml" \
+  >"$LOG_DIR/n5.log" 2>&1 &
+mismatch_pid=$!
 
 mesh_ip() {
-  ip -n "$1" -4 -o addr show dev yaco-mesh 2>/dev/null | awk '{print $4}' | cut -d/ -f1
+  ip -n "$1" -4 -o addr show dev "$MESH_INTERFACE" 2>/dev/null | awk '{print $4}' | cut -d/ -f1
 }
 
 # Prints the node IDs of the last live set that node $1 logged.
@@ -126,14 +156,14 @@ done
 # Traffic must go through the mesh interface, not the underlay.
 route=$(ip -n n1 route get "$(mesh_ip n2)")
 case "$route" in
-*"dev yaco-mesh"*) echo "ok: n1 routes mesh traffic through yaco-mesh" ;;
+*"dev $MESH_INTERFACE"*) echo "ok: n1 routes mesh traffic through $MESH_INTERFACE" ;;
 *) fail "unexpected route: $route" ;;
 esac
 
 # Gossip must listen on the mesh IP only, not on the public interface.
 for n in $NODES; do
-  sockets=$(ip netns exec "n$n" ss -Hlun "sport = :7280" | awk '{print $4}')
-  [ "$sockets" = "$(mesh_ip "n$n"):7280" ] || fail "n$n gossip sockets: $sockets"
+  sockets=$(ip netns exec "n$n" ss -Hlun "sport = :$GOSSIP_PORT" | awk '{print $4}')
+  [ "$sockets" = "$(mesh_ip "n$n"):$GOSSIP_PORT" ] || fail "n$n gossip sockets: $sockets"
 done
 echo "ok: gossip listens on the mesh IP only"
 
@@ -184,5 +214,19 @@ if grep -q "node_id=n4" "$LOG_DIR/n1.log"; then
   fail "n1 received a join request from n4"
 fi
 echo "ok: n4 with a wrong token cannot join"
+
+# The node with another [cluster] config must be refused by the seed and exit.
+deadline=$(($(date +%s) + 60))
+while kill -0 "$mismatch_pid" 2>/dev/null; do
+  [ "$(date +%s)" -lt "$deadline" ] || fail "n5 with another config did not give up"
+  sleep 1
+done
+if wait "$mismatch_pid"; then
+  fail "n5 with another config exited with success"
+fi
+grep -q "cannot join through any seed" "$LOG_DIR/n5.log" || fail "n5 exited for another reason"
+grep "refused join" "$LOG_DIR/n1.log" | grep "node_id=n5" | grep -q "config differs" ||
+  fail "n1 did not refuse n5 because of the config"
+echo "ok: n5 with another [cluster] config cannot join"
 
 echo "PASS"

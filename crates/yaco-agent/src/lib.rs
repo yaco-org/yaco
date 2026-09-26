@@ -1,3 +1,4 @@
+pub mod config;
 pub mod gossip;
 pub mod join;
 pub mod keys;

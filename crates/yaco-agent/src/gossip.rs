@@ -4,7 +4,7 @@
 //! so gossip is encrypted and only nodes with the join token take part.
 
 use std::net::SocketAddr;
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use std::time::{SystemTime, UNIX_EPOCH};
 
 use chitchat::transport::UdpTransport;
 use chitchat::{
@@ -12,29 +12,14 @@ use chitchat::{
     spawn_chitchat,
 };
 
-pub const CLUSTER_ID: &str = "yaco";
-pub const DEFAULT_GOSSIP_INTERVAL: Duration = Duration::from_secs(1);
-
-/// UDP port of chitchat, on the mesh IP.
-pub const GOSSIP_PORT: u16 = 7280;
+use crate::config::ClusterConfig;
 
 /// A node sets this key just before it shuts down.
 /// Other nodes then remove it from the live set at once,
 /// instead of after the failure detector timeout.
 pub const LEAVING_KEY: &str = "leaving";
 
-/// Gossip rounds to wait after setting `LEAVING_KEY`,
-/// so that the key reaches the other nodes.
-pub const LEAVE_ROUNDS: u32 = 3;
-
-/// How long to wait before chitchat removes a dead node.
-/// We wait so that nodes that got disconnected
-/// because of network issues can seamlessly join back.
-/// Once the node is deleted, it will have to be restarted
-/// to execute the regular join procedure again.
-pub const DEAD_NODE_GRACE_PERIOD: u64 = 24;
-
-/// Builds a chitchat config with the chitchat default values.
+/// Builds a chitchat config from the cluster config.
 ///
 /// `seeds` are gossip addresses of other nodes.
 /// An empty list starts a new cluster.
@@ -42,19 +27,25 @@ pub fn config(
     node_id: &str,
     listen_addr: SocketAddr,
     seeds: &[SocketAddr],
-    gossip_interval: Duration,
+    cluster: &ClusterConfig,
 ) -> ChitchatConfig {
     ChitchatConfig {
         chitchat_id: ChitchatId::new(node_id, generation_id(), listen_addr),
-        cluster_id: CLUSTER_ID.to_string(),
-        gossip_interval,
+        cluster_id: cluster.cluster_id.clone(),
+        gossip_interval: cluster.gossip_interval,
         listen_addr,
         seed_nodes: seeds.iter().map(|addr| addr.to_string()).collect(),
         failure_detector_config: FailureDetectorConfig {
-            dead_node_grace_period: Duration::from_hours(DEAD_NODE_GRACE_PERIOD),
-            ..FailureDetectorConfig::default()
+            phi_threshold: cluster.phi_threshold,
+            sampling_window_size: cluster.sampling_window_size,
+            max_interval: cluster.max_heartbeat_interval,
+            initial_interval: cluster.initial_heartbeat_interval,
+            // chitchat keeps a dead node this long, and so its WireGuard peer,
+            // so that a node cut off by the network can come back without a restart.
+            // After this, the node must restart and join again.
+            dead_node_grace_period: cluster.dead_node_grace_period,
         },
-        marked_for_deletion_grace_period: Duration::from_secs(60 * 60),
+        marked_for_deletion_grace_period: cluster.tombstone_grace_period,
         catchup_callback: None,
         extra_liveness_predicate: Some(Box::new(|node_state| {
             node_state.get(LEAVING_KEY).is_none()
@@ -74,11 +65,12 @@ pub async fn start(
 }
 
 /// Leaves the cluster gracefully and stops chitchat.
-pub async fn leave(handle: ChitchatHandle, gossip_interval: Duration) -> anyhow::Result<()> {
+/// Waits `leave_rounds` gossip rounds, so that `LEAVING_KEY` reaches the other nodes.
+pub async fn leave(handle: ChitchatHandle, cluster: &ClusterConfig) -> anyhow::Result<()> {
     handle
         .with_chitchat(|chitchat| chitchat.self_node_state().set(LEAVING_KEY, "true"))
         .await;
-    tokio::time::sleep(gossip_interval * LEAVE_ROUNDS).await;
+    tokio::time::sleep(cluster.gossip_interval * cluster.leave_rounds).await;
     handle.shutdown().await
 }
 

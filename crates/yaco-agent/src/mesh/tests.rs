@@ -7,6 +7,12 @@ use super::*;
 const KEY_NODE_1: &str = "ERERERERERERERERERERERERERERERERERERERERERE=";
 const KEY_NODE_2: &str = "IiIiIiIiIiIiIiIiIiIiIiIiIiIiIiIiIiIiIiIiIiI=";
 
+/// The tests use their own subnets, not the default of the config,
+/// so a change of the default does not break them.
+fn subnet(text: &str) -> Ipv4Net {
+    text.parse().unwrap()
+}
+
 fn peer(public_key: &str, mesh_ip: [u8; 4]) -> MeshPeer {
     MeshPeer {
         public_key: public_key.to_string(),
@@ -17,20 +23,43 @@ fn peer(public_key: &str, mesh_ip: [u8; 4]) -> MeshPeer {
 
 #[test]
 fn mesh_ip_is_stable() {
-    // If this value changes, nodes get new addresses after an upgrade.
-    assert_eq!(mesh_ip("node-1", 0), Ipv4Addr::new(10, 42, 58, 124));
-    assert_eq!(mesh_ip("node-1", 0), mesh_ip("node-1", 0));
-    assert_ne!(mesh_ip("node-1", 0), mesh_ip("node-1", 1));
-    assert_ne!(mesh_ip("node-1", 0), mesh_ip("node-2", 0));
+    // If these values change, nodes get new addresses after an upgrade.
+    let net = subnet("10.42.0.0/16");
+    assert_eq!(mesh_ip(net, "node-1", 0), Ipv4Addr::new(10, 42, 58, 124));
+    assert_eq!(
+        mesh_ip(subnet("192.168.0.0/24"), "node-1", 0),
+        Ipv4Addr::new(192, 168, 0, 140)
+    );
+    assert_ne!(mesh_ip(net, "node-1", 0), mesh_ip(net, "node-1", 1));
+    assert_ne!(mesh_ip(net, "node-1", 0), mesh_ip(net, "node-2", 0));
 }
 
 #[test]
 fn mesh_ip_is_a_host_in_the_subnet() {
-    for attempt in 0..10_000 {
-        let ip = u32::from(mesh_ip("node", attempt));
-        let host = ip - u32::from(SUBNET);
-        assert!((1..=65534).contains(&host), "attempt {attempt}: {ip}");
+    for text in [
+        "10.42.0.0/16",
+        "192.168.4.0/24",
+        "172.16.0.0/12",
+        "10.0.0.8/30",
+    ] {
+        let net = subnet(text);
+        for attempt in 0..10_000 {
+            let ip = mesh_ip(net, "node", attempt);
+            assert!(is_mesh_ip(net, ip), "{text}, attempt {attempt}: {ip}");
+        }
     }
+}
+
+#[test]
+fn mesh_ip_uses_both_hosts_of_a_30() {
+    let net = subnet("10.0.0.8/30");
+    let ips: std::collections::BTreeSet<Ipv4Addr> = (0..100)
+        .map(|attempt| mesh_ip(net, "node", attempt))
+        .collect();
+    assert_eq!(
+        ips.into_iter().collect::<Vec<_>>(),
+        vec![Ipv4Addr::new(10, 0, 0, 9), Ipv4Addr::new(10, 0, 0, 10)]
+    );
 }
 
 #[test]
@@ -79,12 +108,13 @@ fn diff_of_equal_lists_is_empty() {
 
 #[test]
 fn is_mesh_ip_accepts_hosts_only() {
-    assert!(is_mesh_ip(Ipv4Addr::new(10, 42, 0, 1)));
-    assert!(is_mesh_ip(Ipv4Addr::new(10, 42, 255, 254)));
-    assert!(!is_mesh_ip(Ipv4Addr::new(10, 42, 0, 0)));
-    assert!(!is_mesh_ip(Ipv4Addr::new(10, 42, 255, 255)));
-    assert!(!is_mesh_ip(Ipv4Addr::new(10, 43, 0, 1)));
-    assert!(!is_mesh_ip(Ipv4Addr::new(10, 41, 255, 254)));
+    let net = subnet("10.42.0.0/16");
+    assert!(is_mesh_ip(net, Ipv4Addr::new(10, 42, 0, 1)));
+    assert!(is_mesh_ip(net, Ipv4Addr::new(10, 42, 255, 254)));
+    assert!(!is_mesh_ip(net, Ipv4Addr::new(10, 42, 0, 0)));
+    assert!(!is_mesh_ip(net, Ipv4Addr::new(10, 42, 255, 255)));
+    assert!(!is_mesh_ip(net, Ipv4Addr::new(10, 43, 0, 1)));
+    assert!(!is_mesh_ip(net, Ipv4Addr::new(10, 41, 255, 254)));
 }
 
 #[test]
@@ -113,7 +143,7 @@ fn desired_peers_skips_own_node() {
 
 #[test]
 fn pending_peers_replace_by_public_key() {
-    let pending = PendingPeers::default();
+    let pending = PendingPeers::new(Duration::from_secs(60));
     pending.add(vec![peer(KEY_NODE_1, [10, 42, 0, 1])]);
     pending.add(vec![peer(KEY_NODE_1, [10, 42, 0, 2])]);
     assert_eq!(pending.current(&[]), vec![peer(KEY_NODE_1, [10, 42, 0, 2])]);
@@ -121,7 +151,7 @@ fn pending_peers_replace_by_public_key() {
 
 #[test]
 fn pending_peers_are_forgotten_once_live() {
-    let pending = PendingPeers::default();
+    let pending = PendingPeers::new(Duration::from_secs(60));
     pending.add(vec![
         peer(KEY_NODE_1, [10, 42, 0, 1]),
         peer(KEY_NODE_2, [10, 42, 0, 2]),
