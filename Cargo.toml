@@ -31,6 +31,9 @@ toml = "1"
 ipnet = { version = "2", features = ["serde"] }
 humantime-serde = "1"
 
+# Random jitter for join retries
+rand = "0.10"
+
 # Cluster-scope clock
 uhlc = "0.9"
 

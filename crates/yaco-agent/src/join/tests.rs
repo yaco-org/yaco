@@ -117,3 +117,12 @@ fn messages_round_trip_as_json() {
         response
     );
 }
+
+#[test]
+fn jitter_adds_up_to_the_same_delay() {
+    let delay = Duration::from_secs(1);
+    for _ in 0..1000 {
+        let jittered = with_jitter(delay);
+        assert!(jittered >= delay && jittered < delay * 2, "{jittered:?}");
+    }
+}

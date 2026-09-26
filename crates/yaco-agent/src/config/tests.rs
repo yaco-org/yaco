@@ -90,9 +90,11 @@ fn invalid_values_are_errors() {
         "mesh_subnet = \"10.42.1.0/16\"",
         // Too small for the addresses that the agent needs.
         "mesh_subnet = \"10.42.0.0/31\"",
-        "boot_subnet = \"169.254.42.0/32\"",
-        // The subnets overlap.
-        "boot_subnet = \"10.42.0.0/30\"",
+        // Contains the fixed bootstrap addresses.
+        "mesh_subnet = \"169.254.0.0/16\"",
+        "mesh_subnet = \"169.254.42.0/30\"",
+        // No longer configurable.
+        "boot_subnet = \"169.254.42.0/30\"",
         "gossip_interval = \"0s\"",
         "join_rounds = 0",
         "max_mesh_ip_attempts = 0",
@@ -119,16 +121,6 @@ fn invalid_values_are_errors() {
 }
 
 #[test]
-fn boot_addresses_are_the_first_two_hosts() {
-    let cluster = ClusterConfig {
-        boot_subnet: "169.254.7.0/30".parse().unwrap(),
-        ..ClusterConfig::default()
-    };
-    assert_eq!(cluster.boot_server_ip(), Ipv4Addr::new(169, 254, 7, 1));
-    assert_eq!(cluster.boot_client_ip(), Ipv4Addr::new(169, 254, 7, 2));
-}
-
-#[test]
 fn fingerprint_ignores_formatting_and_key_order() {
     let a = Config::parse(&with_cluster_line("gossip_interval = \"2s\"\nmtu = 1400")).unwrap();
     let b = Config::parse(&with_cluster_line(
@@ -148,7 +140,7 @@ fn fingerprint_changes_with_any_cluster_value() {
         "cluster_id = \"other\"",
         "gossip_port = 7290",
         "phi_threshold = 9.0",
-        "boot_subnet = \"169.254.43.0/30\"",
+        "join_port = 7293",
         "max_mesh_ip_attempts = 17",
     ];
     for line in changed_lines {

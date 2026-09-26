@@ -47,13 +47,12 @@ sampling_window_size = 1000
 max_heartbeat_interval = "10s"
 initial_heartbeat_interval = "5s"
 
-# Subnet of the bootstrap tunnel: the first host is the seed, the second host is the joining node.
-boot_subnet = "169.254.42.0/30"
 # TCP port of the join endpoint, inside the bootstrap tunnel.
 join_port = 7283
 join_request_timeout = "5s"
 # How often a joining node tries all seeds before it gives up.
 join_rounds = 5
-join_retry_delay = "1s"
+# Pause between two join rounds. A random part of up to the same length is added.
+join_retry_delay = "5s"
 # How many mesh IPs a joining node proposes to one seed before it gives up.
 max_mesh_ip_attempts = 16

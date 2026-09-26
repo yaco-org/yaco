@@ -17,6 +17,7 @@ mod tests;
 
 use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 use std::sync::Arc;
+use std::time::Duration;
 
 use anyhow::Context;
 use axum::extract::State;
@@ -34,6 +35,15 @@ use tokio::sync::Mutex;
 use crate::config::{ClusterConfig, Config, ConfigFingerprint};
 use crate::keys::ClusterKeys;
 use crate::mesh::{self, MeshPeer, PendingPeers};
+
+/// Addresses inside the bootstrap tunnel. They are not configurable.
+/// They are link-local, so they are never routed,
+/// and a /30 has room for exactly these two hosts.
+/// Every member has the same server address which don't conflict
+/// because each member has its own tunnel to the joining node.
+pub const BOOT_SERVER_IP: Ipv4Addr = Ipv4Addr::new(169, 254, 42, 1);
+pub const BOOT_CLIENT_IP: Ipv4Addr = Ipv4Addr::new(169, 254, 42, 2);
+pub const BOOT_PREFIX_LEN: u8 = 30;
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct JoinRequest {
@@ -122,15 +132,15 @@ impl Bootstrap {
     pub fn set_client(&self, keys: &ClusterKeys, seed: SocketAddr) -> anyhow::Result<()> {
         let mut server = Peer::new(keys.boot_server.public_key());
         server.endpoint = Some(seed);
-        server.allowed_ips = vec![IpAddrMask::host(IpAddr::V4(self.cluster.boot_server_ip()))];
-        self.configure(&keys.boot_client, self.cluster.boot_client_ip(), server)
+        server.allowed_ips = vec![IpAddrMask::host(IpAddr::V4(BOOT_SERVER_IP))];
+        self.configure(&keys.boot_client, BOOT_CLIENT_IP, server)
     }
 
     /// Server role: the only peer is any joining node.
     pub fn set_server(&self, keys: &ClusterKeys) -> anyhow::Result<()> {
         let mut client = Peer::new(keys.boot_client.public_key());
-        client.allowed_ips = vec![IpAddrMask::host(IpAddr::V4(self.cluster.boot_client_ip()))];
-        self.configure(&keys.boot_server, self.cluster.boot_server_ip(), client)
+        client.allowed_ips = vec![IpAddrMask::host(IpAddr::V4(BOOT_CLIENT_IP))];
+        self.configure(&keys.boot_server, BOOT_SERVER_IP, client)
     }
 
     /// Replaces the key, the address and the peers of the interface.
@@ -140,10 +150,7 @@ impl Bootstrap {
                 name: self.interface.clone(),
                 prvkey: private_key.to_string(),
                 // The subnet prefix gives the kernel a route to the other end of the tunnel.
-                addresses: vec![IpAddrMask::new(
-                    IpAddr::V4(ip),
-                    self.cluster.boot_subnet.prefix_len(),
-                )],
+                addresses: vec![IpAddrMask::new(IpAddr::V4(ip), BOOT_PREFIX_LEN)],
                 port: self.port,
                 peers: vec![peer],
                 mtu: Some(self.cluster.mtu),
@@ -174,7 +181,7 @@ pub async fn serve(server: JoinServer) -> anyhow::Result<()> {
     let cluster = &server.config.cluster;
     socket
         .bind(SocketAddr::new(
-            IpAddr::V4(cluster.boot_server_ip()),
+            IpAddr::V4(BOOT_SERVER_IP),
             cluster.join_port,
         ))
         .context("cannot bind the join endpoint")?;
@@ -261,15 +268,11 @@ pub async fn join(
         // So that we don't proxy join requests through an unrelated proxy.
         .no_proxy()
         .build()?;
-    let url = format!(
-        "http://{}:{}/join",
-        cluster.boot_server_ip(),
-        cluster.join_port
-    );
+    let url = format!("http://{BOOT_SERVER_IP}:{}/join", cluster.join_port);
 
     for round in 0..cluster.join_rounds {
         if round > 0 {
-            tokio::time::sleep(cluster.join_retry_delay).await;
+            tokio::time::sleep(with_jitter(cluster.join_retry_delay)).await;
         }
         for &seed in &config.node.seeds {
             boot.set_client(keys, seed)?;
@@ -315,4 +318,14 @@ pub async fn join(
         }
     }
     anyhow::bail!("cannot join through any seed. Check the seed addresses and the join token")
+}
+
+/// Returns `delay` plus a random part of up to `delay`.
+///
+/// All joining nodes share one bootstrap client key,
+/// so a seed sees two nodes that join at the same moment as one WireGuard peer,
+/// and at least one of the two requests times out.
+/// Without the random part, both nodes would retry at the same moment and collide again.
+pub fn with_jitter(delay: Duration) -> Duration {
+    delay + delay.mul_f64(rand::random::<f64>())
 }

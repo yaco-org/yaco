@@ -16,7 +16,7 @@
 mod tests;
 
 use std::fmt;
-use std::net::{IpAddr, Ipv4Addr, SocketAddr};
+use std::net::{IpAddr, SocketAddr};
 use std::path::Path;
 use std::time::Duration;
 
@@ -24,6 +24,8 @@ use anyhow::Context;
 use ipnet::Ipv4Net;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
+
+use crate::join::{BOOT_CLIENT_IP, BOOT_SERVER_IP};
 
 /// Linux limits interface names to 15 bytes.
 const MAX_INTERFACE_NAME_LEN: usize = 15;
@@ -127,9 +129,6 @@ pub struct ClusterConfig {
     pub initial_heartbeat_interval: Duration,
 
     // Join.
-    /// Subnet of the bootstrap tunnel.
-    /// The first host is the seed, the second host is the joining node.
-    pub boot_subnet: Ipv4Net,
     /// TCP port of the join endpoint, inside the bootstrap tunnel.
     pub join_port: u16,
     /// Timeout of one join request, WireGuard handshake included.
@@ -138,6 +137,8 @@ pub struct ClusterConfig {
     /// How often a joining node tries all seeds before it gives up.
     pub join_rounds: u32,
     /// Pause between two join rounds.
+    /// A random part of up to the same length is added,
+    /// so that two nodes that join through the same seed do not collide again.
     #[serde(with = "humantime_serde")]
     pub join_retry_delay: Duration,
     /// How many mesh IPs a joining node proposes to one seed before it gives up.
@@ -164,12 +165,10 @@ impl Default for ClusterConfig {
             max_heartbeat_interval: Duration::from_secs(10),
             initial_heartbeat_interval: Duration::from_secs(5),
 
-            // Link-local: never routed, and no overlap with the mesh or Docker.
-            boot_subnet: "169.254.42.0/30".parse().unwrap(),
             join_port: 7283,
             join_request_timeout: Duration::from_secs(5),
             join_rounds: 5,
-            join_retry_delay: Duration::from_secs(1),
+            join_retry_delay: Duration::from_secs(5),
             max_mesh_ip_attempts: 16,
         }
     }
@@ -209,25 +208,21 @@ impl Config {
             "node.mesh_interface and node.boot_interface are the same"
         );
 
-        for (key, subnet) in [
-            ("cluster.mesh_subnet", cluster.mesh_subnet),
-            ("cluster.boot_subnet", cluster.boot_subnet),
-        ] {
-            // A /31 or /32 has no room for the addresses that the agent needs.
-            anyhow::ensure!(
-                subnet.prefix_len() <= 30,
-                "{key} {subnet} is too small, the longest prefix is /30"
-            );
-            anyhow::ensure!(
-                subnet == subnet.trunc(),
-                "{key} {subnet} has host bits set, write {}",
-                subnet.trunc()
-            );
-        }
+        let mesh_subnet = cluster.mesh_subnet;
+        // A /31 or /32 has no room for host addresses.
         anyhow::ensure!(
-            !cluster.mesh_subnet.contains(&cluster.boot_subnet)
-                && !cluster.boot_subnet.contains(&cluster.mesh_subnet),
-            "cluster.mesh_subnet and cluster.boot_subnet overlap"
+            mesh_subnet.prefix_len() <= 30,
+            "cluster.mesh_subnet {mesh_subnet} is too small, the longest prefix is /30"
+        );
+        anyhow::ensure!(
+            mesh_subnet == mesh_subnet.trunc(),
+            "cluster.mesh_subnet {mesh_subnet} has host bits set, write {}",
+            mesh_subnet.trunc()
+        );
+        anyhow::ensure!(
+            !mesh_subnet.contains(&BOOT_SERVER_IP) && !mesh_subnet.contains(&BOOT_CLIENT_IP),
+            "cluster.mesh_subnet {mesh_subnet} contains the bootstrap addresses \
+             {BOOT_SERVER_IP} and {BOOT_CLIENT_IP}"
         );
 
         anyhow::ensure!(
@@ -279,21 +274,5 @@ impl ClusterConfig {
             .map(|byte| format!("{byte:02x}"))
             .collect();
         ConfigFingerprint(hex)
-    }
-
-    /// Address of a seed inside the bootstrap tunnel: the first host of `boot_subnet`.
-    pub fn boot_server_ip(&self) -> Ipv4Addr {
-        self.boot_subnet
-            .hosts()
-            .next()
-            .expect("validated: /30 or larger")
-    }
-
-    /// Address of a joining node inside the bootstrap tunnel: the second host of `boot_subnet`.
-    pub fn boot_client_ip(&self) -> Ipv4Addr {
-        self.boot_subnet
-            .hosts()
-            .nth(1)
-            .expect("validated: /30 or larger")
     }
 }
