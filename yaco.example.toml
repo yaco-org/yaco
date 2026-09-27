@@ -54,3 +54,6 @@ join_rounds = 5
 join_retry_delay = "5s"
 # How many mesh IPs a joining node proposes to one seed before it gives up.
 max_mesh_ip_attempts = 16
+
+# TCP port of the node API, on the mesh IP only.
+api_port = 7284

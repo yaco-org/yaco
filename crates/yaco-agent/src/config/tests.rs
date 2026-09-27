@@ -144,6 +144,7 @@ fn fingerprint_changes_with_any_cluster_value() {
         "phi_threshold = 9.0",
         "join_port = 7293",
         "max_mesh_ip_attempts = 17",
+        "api_port = 7294",
     ];
     for line in changed_lines {
         let config = Config::parse(&with_cluster_line(line)).unwrap();

@@ -1,6 +1,6 @@
 [package]
 name = "yaco-api"
-description = "Definitions of the YACO node API: paths, request and response types, and the OpenAPI spec."
+description = "Definitions of the YACO node API: paths, and request and response types."
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true

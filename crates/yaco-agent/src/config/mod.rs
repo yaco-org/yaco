@@ -140,6 +140,11 @@ pub struct ClusterConfig {
     pub join_retry_delay: Duration,
     /// How many mesh IPs a joining node proposes to one seed before it gives up.
     pub max_mesh_ip_attempts: u32,
+
+    // Node API.
+    /// TCP port of the node API, on the mesh IP.
+    /// The same on every node, so that a node can forward a request to another node.
+    pub api_port: u16,
 }
 
 impl Default for ClusterConfig {
@@ -166,6 +171,8 @@ impl Default for ClusterConfig {
             join_rounds: 5,
             join_retry_delay: Duration::from_secs(5),
             max_mesh_ip_attempts: 16,
+
+            api_port: 7284,
         }
     }
 }

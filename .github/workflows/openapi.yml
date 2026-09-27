@@ -5,10 +5,14 @@ on:
     branches: [main]
     paths:
       - "crates/yaco-api/**"
+      - "crates/yaco-agent/src/api/**"
+      - "crates/yaco-agent/examples/openapi.rs"
       - ".github/workflows/openapi.yml"
   pull_request:
     paths:
       - "crates/yaco-api/**"
+      - "crates/yaco-agent/src/api/**"
+      - "crates/yaco-agent/examples/openapi.rs"
       - ".github/workflows/openapi.yml"
   workflow_dispatch:
 
@@ -27,7 +31,8 @@ jobs:
       - name: Render the spec
         run: |
           mkdir api
-          cargo run --locked -p yaco-api --example openapi > api/openapi.json
+          # The spec comes from the handlers of the agent, see crates/yaco-agent/src/api.
+          cargo run --locked -p yaco-agent --example openapi > api/openapi.json
           cp crates/yaco-api/pages/index.html api/
       - uses: actions/upload-artifact@v7
         with:

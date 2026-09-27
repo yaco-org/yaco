@@ -60,8 +60,9 @@ Open these UDP ports on every node (the defaults are shown):
 | 7281 | `node.mesh_port` | Mesh WireGuard interface                         |
 | 7282 | `node.boot_port` | Bootstrap WireGuard interface, for joining nodes |
 
-Gossip (`cluster.gossip_port`, UDP 7280) runs inside the mesh, on the mesh IP only.
-Do not open it on the public interface.
+Gossip (`cluster.gossip_port`, UDP 7280) and the node API (`cluster.api_port`, TCP 7284)
+run inside the mesh, on the mesh IP only.
+Do not open them on the public interface.
 
 ## Tests
 
@@ -87,6 +88,8 @@ unshare --user --map-root-user --net sh
 
 ## Node API
 
-The node API is defined in the `yaco-api` crate.
-The button at the top of README.md opens its OpenAPI spec,
-which the `OpenAPI spec` workflow publishes after every change of the crate.
+Every node serves the node API on its mesh IP (`cluster.api_port`, TCP 7284).
+For now every operation answers 501 Not Implemented.
+
+The handlers are in `crates/yaco-agent/src/api`, and the paths and types are in the `yaco-api` crate,
+which clients can use too.

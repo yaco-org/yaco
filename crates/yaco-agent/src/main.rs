@@ -2,10 +2,13 @@ use std::io::IsTerminal;
 use std::net::{IpAddr, SocketAddr};
 use std::path::PathBuf;
 
+use anyhow::Context;
 use clap::Parser;
 use defguard_wireguard_rs::key::Key;
+use tokio::net::TcpListener;
 use tokio::sync::{mpsc, watch};
 use tracing_subscriber::EnvFilter;
+use yaco_agent::api;
 use yaco_agent::config::Config;
 use yaco_agent::gossip;
 use yaco_agent::join::{self, Bootstrap, JoinServer};
@@ -72,6 +75,11 @@ async fn main() -> anyhow::Result<()> {
         gossip::config(&config.node.id, gossip_addr, &gossip_seeds, &config.cluster);
     let handle = gossip::start(chitchat_config, own_facts.to_facts()).await?;
 
+    let api_addr = SocketAddr::new(IpAddr::V4(own_facts.mesh_ip), config.cluster.api_port);
+    let api_listener = TcpListener::bind(api_addr)
+        .await
+        .with_context(|| format!("cannot bind the node API to {api_addr}"))?;
+
     // From now on, this node is a seed for other nodes.
     boot.set_server(&keys)?;
     let join_server = JoinServer::new(
@@ -86,6 +94,7 @@ async fn main() -> anyhow::Result<()> {
         node_id = %config.node.id,
         public_ip = %config.node.public_ip,
         gossip = %gossip_addr,
+        api = %api_addr,
         mesh_ip = %own_facts.mesh_ip,
         wg_endpoint = %own_facts.endpoint,
         boot_port = config.node.boot_port,
@@ -105,6 +114,10 @@ async fn main() -> anyhow::Result<()> {
         }
         result = join::serve(join_server) => {
             tracing::error!("join endpoint stopped: {result:?}");
+            handle.shutdown().await
+        }
+        result = api::serve(api_listener) => {
+            tracing::error!("node API stopped: {result:?}");
             handle.shutdown().await
         }
         _ = tokio::signal::ctrl_c() => {
