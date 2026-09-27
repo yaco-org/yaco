@@ -24,11 +24,12 @@ jobs:
         with:
           toolchain: "1.98"
       - uses: Swatinem/rust-cache@v2
+      # The site root stays free for other pages, for example coverage results.
       - name: Render the spec
         run: |
-          mkdir site
-          cargo run --locked -p yaco-api --example openapi > site/openapi.json
-          cp crates/yaco-api/pages/index.html site/
+          mkdir -p site/api
+          cargo run --locked -p yaco-api --example openapi > site/api/openapi.json
+          cp crates/yaco-api/pages/index.html site/api/
       - uses: actions/upload-pages-artifact@v5
         with:
           path: site

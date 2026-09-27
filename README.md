@@ -2,7 +2,7 @@
 
 Egalitarian container orchestration platform.
 
-[![OpenAPI spec](https://img.shields.io/badge/OpenAPI-node%20API-6BA539?logo=openapiinitiative&logoColor=white)](https://yaco-org.github.io/yaco/)
+[![OpenAPI spec](https://img.shields.io/badge/OpenAPI-node%20API-6BA539?logo=openapiinitiative&logoColor=white)](https://yaco-org.github.io/yaco/api/)
 
 ## Privileges
 
