@@ -31,10 +31,12 @@ pub struct ContainerManifest {
     /// Replaces the command of the image.
     /// Empty: the container runs the command of the image.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    #[schema(example = json!(["nginx", "-g", "daemon off;"]))]
     pub command: Vec<String>,
     /// Environment variables.
     /// Keys that start with `YACO_` are reserved for the agent.
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    #[schema(example = json!({"TZ": "UTC"}))]
     pub env: BTreeMap<String, String>,
 }
 
@@ -42,6 +44,7 @@ pub struct ContainerManifest {
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, ToSchema)]
 pub struct ErrorResponse {
     /// What went wrong, for people.
+    #[schema(example = "no container has the name \"web\"")]
     pub message: String,
 }
 
