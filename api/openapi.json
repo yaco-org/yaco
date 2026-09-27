@@ -1,0 +1,261 @@
+{
+  "openapi": "3.1.0",
+  "info": {
+    "title": "YACO node API",
+    "description": "Every node of a YACO cluster serves this API on its mesh IP.",
+    "license": {
+      "name": "MIT",
+      "identifier": "MIT"
+    },
+    "version": "0.1.0"
+  },
+  "paths": {
+    "/v1/containers": {
+      "get": {
+        "tags": [
+          "containers"
+        ],
+        "summary": "Returns all container manifests.",
+        "operationId": "list_containers",
+        "responses": {
+          "200": {
+            "description": "All manifests",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "array",
+                  "items": {
+                    "$ref": "#/components/schemas/ContainerManifest"
+                  }
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/v1/containers/{name}": {
+      "get": {
+        "tags": [
+          "containers"
+        ],
+        "summary": "Returns one container manifest.",
+        "operationId": "get_container",
+        "parameters": [
+          {
+            "name": "name",
+            "in": "path",
+            "description": "Name of the container",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "The manifest",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ContainerManifest"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "No container has this name",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            }
+          }
+        }
+      },
+      "put": {
+        "tags": [
+          "containers"
+        ],
+        "summary": "Creates or replaces a container manifest.",
+        "operationId": "put_container",
+        "parameters": [
+          {
+            "name": "name",
+            "in": "path",
+            "description": "Name of the container",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "X-Yaco-Sender",
+            "in": "header",
+            "description": "Sender of the request",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/ContainerManifest"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "description": "The manifest was replaced",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ContainerManifest"
+                }
+              }
+            }
+          },
+          "201": {
+            "description": "The manifest was created",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ContainerManifest"
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "The manifest is not valid",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            }
+          }
+        }
+      },
+      "delete": {
+        "tags": [
+          "containers"
+        ],
+        "summary": "Deletes a container manifest.",
+        "operationId": "delete_container",
+        "parameters": [
+          {
+            "name": "name",
+            "in": "path",
+            "description": "Name of the container",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "X-Yaco-Sender",
+            "in": "header",
+            "description": "Sender of the request",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "204": {
+            "description": "The manifest was deleted"
+          },
+          "404": {
+            "description": "No container has this name",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            }
+          }
+        }
+      }
+    }
+  },
+  "components": {
+    "schemas": {
+      "ContainerManifest": {
+        "type": "object",
+        "description": "A container manifest: the desired state of one container.",
+        "required": [
+          "name",
+          "image"
+        ],
+        "properties": {
+          "command": {
+            "type": "array",
+            "items": {
+              "type": "string"
+            },
+            "description": "Replaces the command of the image.\nEmpty: the container runs the command of the image.",
+            "example": [
+              "nginx",
+              "-g",
+              "daemon off;"
+            ]
+          },
+          "env": {
+            "type": "object",
+            "description": "Environment variables.\nKeys that start with `YACO_` are reserved for the agent.",
+            "additionalProperties": {
+              "type": "string"
+            },
+            "propertyNames": {
+              "type": "string"
+            },
+            "example": {
+              "TZ": "UTC"
+            }
+          },
+          "image": {
+            "type": "string",
+            "description": "Docker image reference.",
+            "example": "nginx:1.29"
+          },
+          "name": {
+            "type": "string",
+            "description": "Unique in the cluster.\nMust be equal to the last segment of the path.",
+            "example": "web"
+          }
+        },
+        "additionalProperties": false
+      },
+      "ErrorResponse": {
+        "type": "object",
+        "description": "Body of every failed request.",
+        "required": [
+          "message"
+        ],
+        "properties": {
+          "message": {
+            "type": "string",
+            "description": "What went wrong, for people.",
+            "example": "no container has the name \"web\""
+          }
+        }
+      }
+    }
+  },
+  "tags": [
+    {
+      "name": "containers",
+      "description": "Container manifests"
+    }
+  ]
+}
