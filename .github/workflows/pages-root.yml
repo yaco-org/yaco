@@ -26,6 +26,7 @@ jobs:
       - uses: peaceiris/actions-gh-pages@v4
         with:
           github_token: ${{ secrets.GITHUB_TOKEN }}
+          publish_branch: gh-pages
           publish_dir: .github/pages
           # The root is the whole branch.
           # Without this, the deploy would delete /api and /coverage.
