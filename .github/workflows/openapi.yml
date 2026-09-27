@@ -1,0 +1,52 @@
+name: OpenAPI spec
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - "crates/yaco-api/**"
+      - ".github/workflows/openapi.yml"
+  pull_request:
+    paths:
+      - "crates/yaco-api/**"
+      - ".github/workflows/openapi.yml"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  render:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: "1.98"
+      - uses: Swatinem/rust-cache@v2
+      - name: Render the spec
+        run: |
+          mkdir site
+          cargo run --locked -p yaco-api --example openapi > site/openapi.json
+          cp crates/yaco-api/pages/index.html site/
+      - uses: actions/upload-pages-artifact@v5
+        with:
+          path: site
+
+  deploy:
+    if: github.event_name != 'pull_request' && github.ref == 'refs/heads/main'
+    needs: render
+    runs-on: ubuntu-latest
+    permissions:
+      pages: write
+      id-token: write
+    environment:
+      name: github-pages
+      url: ${{ steps.deployment.outputs.page_url }}
+    # Only one deployment at a time. A newer push replaces a waiting one.
+    concurrency:
+      group: pages
+      cancel-in-progress: true
+    steps:
+      - id: deployment
+        uses: actions/deploy-pages@v5

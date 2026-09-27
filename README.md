@@ -2,6 +2,8 @@
 
 Egalitarian container orchestration platform.
 
+[![OpenAPI spec](https://img.shields.io/badge/OpenAPI-node%20API-6BA539?logo=openapiinitiative&logoColor=white)](https://yaco-org.github.io/yaco/)
+
 ## Privileges
 
 The agent manages two WireGuard interfaces (`yaco-mesh` and `yaco-boot`), so it needs superuser permissions.
@@ -81,3 +83,9 @@ start a shell in a new user and network namespace:
 ```sh
 unshare --user --map-root-user --net sh
 ```
+
+## Node API
+
+The node API is defined in the `yaco-api` crate.
+The button at the top of README.md opens its OpenAPI spec,
+which the `OpenAPI spec` workflow publishes after every change of the crate.

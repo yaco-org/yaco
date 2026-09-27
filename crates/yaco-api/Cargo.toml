@@ -1,0 +1,14 @@
+[package]
+name = "yaco-api"
+description = "Definitions of the YACO node API: paths, request and response types, and the OpenAPI spec."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+[dependencies]
+serde.workspace = true
+utoipa.workspace = true
+
+[dev-dependencies]
+serde_json.workspace = true
