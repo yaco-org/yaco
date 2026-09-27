@@ -178,12 +178,13 @@ mod handle_join {
 
         let (new_peers_tx, new_peers) = mpsc::unbounded_channel();
         let (peers, peers_rx) = watch::channel(vec![peer("node-2", KEY_NODE_2, [10, 42, 0, 2])]);
-        let server = Arc::new(JoinServer {
+        let server = Arc::new(JoinServer::new(
             config,
-            own: peer("node-1", KEY_NODE_1, [10, 42, 0, 1]),
-            new_peers: new_peers_tx,
-            peers: peers_rx,
-        });
+            peer("node-1", KEY_NODE_1, [10, 42, 0, 1]),
+            "10.42.0.1:7280".parse().unwrap(),
+            new_peers_tx,
+            peers_rx,
+        ));
         Seed {
             server,
             new_peers,
@@ -216,11 +217,7 @@ mod handle_join {
             mesh_ips(&response),
             vec![Ipv4Addr::new(10, 42, 0, 1), Ipv4Addr::new(10, 42, 0, 2)]
         );
-        let gossip_port = seed.server.config.cluster.gossip_port;
-        assert_eq!(
-            response.gossip_seed,
-            SocketAddr::new(IpAddr::V4(Ipv4Addr::new(10, 42, 0, 1)), gossip_port)
-        );
+        assert_eq!(response.gossip_seed, "10.42.0.1:7280".parse().unwrap());
         assert_eq!(seed.new_peers.try_recv(), Ok(request.peer));
     }
 

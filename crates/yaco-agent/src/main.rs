@@ -42,7 +42,6 @@ async fn main() -> anyhow::Result<()> {
     // A new key on every start. Storing it on disk is a later step.
     let private_key = Key::generate();
     let public_key = private_key.public_key();
-    let endpoint = SocketAddr::new(config.node.public_ip, config.node.mesh_port);
     let boot = Bootstrap::create(&config)?;
     // Pending peers to `mesh::sync_peers`, and all peers of this node back to the join server.
     let (new_peers_tx, new_peers_rx) = mpsc::unbounded_channel();
@@ -50,16 +49,13 @@ async fn main() -> anyhow::Result<()> {
 
     let (own_facts, members, gossip_seeds) = if config.node.seeds.is_empty() {
         tracing::info!("no seeds, starting a new cluster");
-        let own_facts = MeshPeer {
-            node_id: config.node.id.clone(),
-            public_key,
-            mesh_ip: config.cluster.mesh_subnet.mesh_ip(&config.node.id, 0),
-            endpoint,
-        };
-        (own_facts, Vec::new(), Vec::new())
+        (
+            MeshPeer::own(&config, &public_key, 0),
+            Vec::new(),
+            Vec::new(),
+        )
     } else {
-        let (own_facts, response) =
-            join::join(&boot, &keys, &config, &public_key, endpoint).await?;
+        let (own_facts, response) = join::join(&boot, &keys, &config, &public_key).await?;
         // The gossip seed is the mesh address of the seed.
         (own_facts, response.members, vec![response.gossip_seed])
     };
@@ -78,12 +74,13 @@ async fn main() -> anyhow::Result<()> {
 
     // From now on, this node is a seed for other nodes.
     boot.set_server(&keys)?;
-    let join_server = JoinServer {
-        config: config.clone(),
-        own: own_facts.clone(),
-        new_peers: new_peers_tx,
-        peers: peers_rx,
-    };
+    let join_server = JoinServer::new(
+        config.clone(),
+        own_facts.clone(),
+        gossip_addr,
+        new_peers_tx,
+        peers_rx,
+    );
 
     tracing::info!(
         node_id = %config.node.id,

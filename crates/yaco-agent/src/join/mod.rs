@@ -159,13 +159,33 @@ impl Bootstrap {
 
 /// Shared state of the join endpoint.
 pub struct JoinServer {
-    pub config: Config,
+    config: Config,
     /// Facts of this node.
-    pub own: MeshPeer,
+    own: MeshPeer,
+    /// Gossip address of this node, inside the mesh.
+    gossip_addr: SocketAddr,
     /// Sends the peer of every accepted node to `mesh::sync_peers`.
-    pub new_peers: mpsc::UnboundedSender<MeshPeer>,
+    new_peers: mpsc::UnboundedSender<MeshPeer>,
     /// All peers of this node, from `mesh::sync_peers`.
-    pub peers: watch::Receiver<Vec<MeshPeer>>,
+    peers: watch::Receiver<Vec<MeshPeer>>,
+}
+
+impl JoinServer {
+    pub fn new(
+        config: Config,
+        own: MeshPeer,
+        gossip_addr: SocketAddr,
+        new_peers: mpsc::UnboundedSender<MeshPeer>,
+        peers: watch::Receiver<Vec<MeshPeer>>,
+    ) -> JoinServer {
+        JoinServer {
+            config,
+            own,
+            gossip_addr,
+            new_peers,
+            peers,
+        }
+    }
 }
 
 /// Serves `POST /join` on the bootstrap interface only.
@@ -197,10 +217,6 @@ async fn handle_join(
     Json(request): Json<JoinRequest>,
 ) -> Result<Json<JoinResponse>, (StatusCode, String)> {
     let node_id = &request.peer.node_id;
-    let gossip_seed = SocketAddr::new(
-        IpAddr::V4(server.own.mesh_ip),
-        server.config.cluster.gossip_port,
-    );
 
     // The peers include dead nodes, because a dead node can come back and still have its mesh IP,
     // and the nodes that joined but are not in gossip yet.
@@ -228,7 +244,7 @@ async fn handle_join(
             }
             Ok(Json(JoinResponse {
                 members,
-                gossip_seed,
+                gossip_seed: server.gossip_addr,
             }))
         }
         Err(JoinRefusal::ConfigMismatch) => {
@@ -261,10 +277,8 @@ pub async fn join(
     keys: &ClusterKeys,
     config: &Config,
     public_key: &Key,
-    endpoint: SocketAddr,
 ) -> anyhow::Result<(MeshPeer, JoinResponse)> {
     let cluster = &config.cluster;
-    let node_id = &config.node.id;
     let config_fingerprint = cluster.fingerprint();
     let client = reqwest::Client::builder()
         .timeout(cluster.join_request_timeout)
@@ -281,12 +295,7 @@ pub async fn join(
             boot.set_client(keys, seed)?;
             let mut attempt = 0;
             while attempt < cluster.max_mesh_ip_attempts {
-                let peer = MeshPeer {
-                    node_id: node_id.clone(),
-                    public_key: public_key.clone(),
-                    mesh_ip: cluster.mesh_subnet.mesh_ip(node_id, attempt),
-                    endpoint,
-                };
+                let peer = MeshPeer::own(config, public_key, attempt);
                 let request = JoinRequest {
                     config_fingerprint: config_fingerprint.clone(),
                     peer: peer.clone(),

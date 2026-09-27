@@ -97,6 +97,22 @@ fn is_host_accepts_hosts_only() {
     assert!(!net.is_host(Ipv4Addr::new(10, 41, 255, 254)));
 }
 
+#[test]
+fn own_facts_come_from_the_config() {
+    let config = Config::parse(
+        "[node]\nid = \"node-1\"\npublic_ip = \"192.0.2.1\"\nmesh_port = 9001\n\
+         [cluster]\nmesh_subnet = \"10.42.0.0/16\"\n",
+    )
+    .unwrap();
+    let key = Key::try_from(KEY_NODE_1).unwrap();
+
+    let own = MeshPeer::own(&config, &key, 1);
+    assert_eq!(own.node_id, "node-1");
+    assert_eq!(own.public_key, key);
+    assert_eq!(own.mesh_ip, subnet("10.42.0.0/16").mesh_ip("node-1", 1));
+    assert_eq!(own.endpoint, "192.0.2.1:9001".parse().unwrap());
+}
+
 mod from_node_state {
     use super::*;
     use crate::test_util::{chitchat_id, key_values, node_state};

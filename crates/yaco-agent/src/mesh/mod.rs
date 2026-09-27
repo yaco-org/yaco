@@ -62,6 +62,16 @@ pub struct MeshPeer {
 }
 
 impl MeshPeer {
+    /// The facts of this node, with the mesh IP of `attempt` (see `MeshSubnet::mesh_ip`).
+    pub fn own(config: &Config, public_key: &Key, attempt: u32) -> MeshPeer {
+        MeshPeer {
+            node_id: config.node.id.clone(),
+            public_key: public_key.clone(),
+            mesh_ip: config.cluster.mesh_subnet.mesh_ip(&config.node.id, attempt),
+            endpoint: SocketAddr::new(config.node.public_ip, config.node.mesh_port),
+        }
+    }
+
     /// Parses the facts of one node from its chitchat state.
     /// Received data can be malformed, so this never panics.
     pub fn from_node_state(state: &NodeState) -> anyhow::Result<MeshPeer> {
