@@ -72,13 +72,17 @@ pub enum JoinRefusal {
     MeshIpInUse,
 }
 
-/// Checks a join request against the config and the known members of the seed.
-/// `members` must include the seed itself and the pending peers.
+/// Checks a join request against the config and the peers of the seed.
+/// `own` is the seed. `peers` are all current peers from `mesh::sync_peers`.
+///
+/// Returns the members for the join response:
+/// the seed and its peers, without earlier generations of the joining node.
 pub fn check_join(
     request: &JoinRequest,
     cluster: &ClusterConfig,
-    members: &[MeshPeer],
-) -> Result<(), JoinRefusal> {
+    own: &MeshPeer,
+    peers: &[MeshPeer],
+) -> Result<Vec<MeshPeer>, JoinRefusal> {
     if request.config_fingerprint != cluster.fingerprint() {
         return Err(JoinRefusal::ConfigMismatch);
     }
@@ -91,14 +95,20 @@ pub fn check_join(
             request.peer.mesh_ip
         )));
     }
-    // The same key is the same node, for example a retried request.
-    let in_use = members
-        .iter()
-        .any(|m| m.mesh_ip == request.peer.mesh_ip && m.public_key != request.peer.public_key);
-    if in_use {
+
+    // An earlier generation of the joining node gives its mesh IP free.
+    // So does a retried request of the same node.
+    let mut members = vec![own.clone()];
+    members.extend(
+        peers
+            .iter()
+            .filter(|peer| peer.node_id != request.peer.node_id)
+            .cloned(),
+    );
+    if members.iter().any(|m| m.mesh_ip == request.peer.mesh_ip) {
         return Err(JoinRefusal::MeshIpInUse);
     }
-    Ok(())
+    Ok(members)
 }
 
 /// The bootstrap interface of this node.
@@ -217,22 +227,10 @@ async fn handle_join(
     Json(request): Json<JoinRequest>,
 ) -> Result<Json<JoinResponse>, (StatusCode, String)> {
     let node_id = &request.peer.node_id;
+    let peers = server.peers.borrow().clone();
 
-    // The peers include dead nodes, because a dead node can come back and still have its mesh IP,
-    // and the nodes that joined but are not in gossip yet.
-    // An earlier generation of the joining node gives its mesh IP free.
-    let mut members = vec![server.own.clone()];
-    members.extend(
-        server
-            .peers
-            .borrow()
-            .iter()
-            .filter(|peer| peer.node_id != *node_id)
-            .cloned(),
-    );
-
-    match check_join(&request, &server.config.cluster, &members) {
-        Ok(()) => {
+    match check_join(&request, &server.config.cluster, &server.own, &peers) {
+        Ok(members) => {
             tracing::info!(%node_id, mesh_ip = %request.peer.mesh_ip, endpoint = %request.peer.endpoint, "accepted join");
             // Add the new node as a mesh peer now, not after gossip.
             if server.new_peers.send(request.peer.clone()).is_err() {

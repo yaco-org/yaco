@@ -37,83 +37,104 @@ fn request(node_id: &str, public_key: &str, mesh_ip: [u8; 4]) -> JoinRequest {
     }
 }
 
-#[test]
-fn free_mesh_ip_is_accepted() {
-    let members = vec![peer("node-1", KEY_NODE_1, [10, 42, 0, 1])];
-    assert_eq!(
-        check_join(
-            &request("node-2", KEY_NODE_2, [10, 42, 0, 2]),
-            &cluster(),
-            &members
-        ),
-        Ok(())
-    );
-}
+/// Checks of the seed, without the HTTP handler.
+///
+/// Every test starts with the same cluster:
+///
+/// | Node   | Role               | Mesh IP   | Key          |
+/// |--------|--------------------|-----------|--------------|
+/// | node-1 | the seed           | 10.42.0.1 | `KEY_NODE_1` |
+/// | node-2 | a peer of the seed | 10.42.0.2 | `KEY_NODE_2` |
+///
+/// `node-3` is a new node that joins.
+mod check_join {
+    use super::*;
 
-#[test]
-fn used_mesh_ip_is_a_conflict() {
-    let members = vec![peer("node-1", KEY_NODE_1, [10, 42, 0, 1])];
-    assert_eq!(
-        check_join(
-            &request("node-2", KEY_NODE_2, [10, 42, 0, 1]),
-            &cluster(),
-            &members
-        ),
-        Err(JoinRefusal::MeshIpInUse)
-    );
-}
+    fn own() -> MeshPeer {
+        peer("node-1", KEY_NODE_1, [10, 42, 0, 1])
+    }
 
-#[test]
-fn retried_join_of_the_same_node_is_accepted() {
-    let members = vec![peer("node-2", KEY_NODE_2, [10, 42, 0, 2])];
-    assert_eq!(
-        check_join(
-            &request("node-2", KEY_NODE_2, [10, 42, 0, 2]),
-            &cluster(),
-            &members
-        ),
-        Ok(())
-    );
-}
+    fn peers() -> Vec<MeshPeer> {
+        vec![peer("node-2", KEY_NODE_2, [10, 42, 0, 2])]
+    }
 
-#[test]
-fn malformed_requests_are_refused() {
-    let bad = |r: JoinRequest| {
-        matches!(
-            check_join(&r, &cluster(), &[]),
+    fn check(request: &JoinRequest) -> Result<Vec<MeshPeer>, JoinRefusal> {
+        check_join(request, &cluster(), &own(), &peers())
+    }
+
+    #[test]
+    fn free_mesh_ip_is_accepted_with_the_seed_and_its_peers_as_members() {
+        let members = check(&request("node-3", KEY_NODE_3, [10, 42, 0, 3])).unwrap();
+        assert_eq!(members, vec![own(), peers()[0].clone()]);
+    }
+
+    #[test]
+    fn mesh_ip_of_the_seed_or_a_peer_is_a_conflict() {
+        for taken in [[10, 42, 0, 1], [10, 42, 0, 2]] {
+            assert_eq!(
+                check(&request("node-3", KEY_NODE_3, taken)),
+                Err(JoinRefusal::MeshIpInUse),
+                "{taken:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn retried_join_of_the_same_node_is_accepted() {
+        // node-3 joined, and it is a peer of the seed now. Its response was lost, so it asks again.
+        let node_3 = peer("node-3", KEY_NODE_3, [10, 42, 0, 3]);
+        let mut peers = peers();
+        peers.push(node_3.clone());
+
+        let request = request("node-3", KEY_NODE_3, [10, 42, 0, 3]);
+        let members = check_join(&request, &cluster(), &own(), &peers).unwrap();
+        assert!(!members.contains(&node_3), "node-3 is not its own member");
+    }
+
+    #[test]
+    fn restarted_node_gets_its_old_mesh_ip_back() {
+        // node-2 restarted with a new key and proposes the IP of its old generation.
+        let request = request("node-2", KEY_NODE_2_RESTARTED, [10, 42, 0, 2]);
+        assert_eq!(check(&request), Ok(vec![own()]));
+    }
+
+    #[test]
+    fn node_with_the_id_of_the_seed_cannot_take_its_mesh_ip() {
+        let request = request("node-1", KEY_NODE_3, [10, 42, 0, 1]);
+        assert_eq!(check(&request), Err(JoinRefusal::MeshIpInUse));
+    }
+
+    #[test]
+    fn malformed_requests_are_refused() {
+        let bad = |r: JoinRequest| matches!(check(&r), Err(JoinRefusal::BadRequest(_)));
+
+        assert!(bad(request("", KEY_NODE_3, [10, 42, 0, 3])));
+        assert!(bad(request("node-3", KEY_NODE_3, [192, 0, 2, 1])));
+        assert!(bad(request("node-3", KEY_NODE_3, [10, 42, 0, 0])));
+    }
+
+    #[test]
+    fn other_cluster_config_is_refused() {
+        let mut other = cluster();
+        other.gossip_interval *= 2;
+        let mut request = request("node-3", KEY_NODE_3, [10, 42, 0, 3]);
+        request.config_fingerprint = other.fingerprint();
+        assert_eq!(check(&request), Err(JoinRefusal::ConfigMismatch));
+    }
+
+    #[test]
+    fn mesh_ip_outside_the_configured_subnet_is_refused() {
+        let small = ClusterConfig {
+            mesh_subnet: "10.42.0.0/24".parse().unwrap(),
+            ..cluster()
+        };
+        let mut request = request("node-3", KEY_NODE_3, [10, 42, 1, 3]);
+        request.config_fingerprint = small.fingerprint();
+        assert!(matches!(
+            check_join(&request, &small, &own(), &peers()),
             Err(JoinRefusal::BadRequest(_))
-        )
-    };
-
-    assert!(bad(request("", KEY_NODE_2, [10, 42, 0, 2])));
-    assert!(bad(request("node-2", KEY_NODE_2, [192, 0, 2, 1])));
-    assert!(bad(request("node-2", KEY_NODE_2, [10, 42, 0, 0])));
-}
-
-#[test]
-fn other_cluster_config_is_refused() {
-    let mut other = cluster();
-    other.gossip_interval *= 2;
-    let mut request = request("node-2", KEY_NODE_2, [10, 42, 0, 2]);
-    request.config_fingerprint = other.fingerprint();
-    assert_eq!(
-        check_join(&request, &cluster(), &[]),
-        Err(JoinRefusal::ConfigMismatch)
-    );
-}
-
-#[test]
-fn mesh_ip_outside_the_configured_subnet_is_refused() {
-    let small = ClusterConfig {
-        mesh_subnet: "10.42.0.0/24".parse().unwrap(),
-        ..cluster()
-    };
-    let mut request = request("node-2", KEY_NODE_2, [10, 42, 1, 2]);
-    request.config_fingerprint = small.fingerprint();
-    assert!(matches!(
-        check_join(&request, &small, &[]),
-        Err(JoinRefusal::BadRequest(_))
-    ));
+        ));
+    }
 }
 
 #[test]
