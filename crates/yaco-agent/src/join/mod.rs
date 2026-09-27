@@ -33,7 +33,7 @@ use tokio::sync::{mpsc, watch};
 
 use crate::config::{ClusterConfig, Config, ConfigFingerprint};
 use crate::keys::ClusterKeys;
-use crate::mesh::{self, MeshPeer};
+use crate::mesh::MeshPeer;
 
 /// Addresses inside the bootstrap tunnel. They are not configurable.
 /// They are link-local, so they are never routed,
@@ -85,9 +85,7 @@ pub fn check_join(
     if request.peer.node_id.is_empty() {
         return Err(JoinRefusal::BadRequest("empty node_id".to_string()));
     }
-    mesh::check_public_key(&request.peer.public_key)
-        .map_err(|err| JoinRefusal::BadRequest(err.to_string()))?;
-    if !mesh::is_mesh_ip(cluster.mesh_subnet, request.peer.mesh_ip) {
+    if !cluster.mesh_subnet.is_host(request.peer.mesh_ip) {
         return Err(JoinRefusal::BadRequest(format!(
             "{} is not in the mesh subnet",
             request.peer.mesh_ip
@@ -256,13 +254,13 @@ async fn handle_join(
 /// Joins the cluster through one of the seeds in `node.seeds`.
 ///
 /// The seeds are public bootstrap endpoints (IP and bootstrap port) of members.
-/// Proposes `mesh_ip(mesh_subnet, node.id, attempt)` and takes the next attempt on HTTP 409.
+/// Proposes `mesh_subnet.mesh_ip(node.id, attempt)` and takes the next attempt on HTTP 409.
 /// Returns the accepted facts of this node and the join response.
 pub async fn join(
     boot: &Bootstrap,
     keys: &ClusterKeys,
     config: &Config,
-    public_key: &str,
+    public_key: &Key,
     endpoint: SocketAddr,
 ) -> anyhow::Result<(MeshPeer, JoinResponse)> {
     let cluster = &config.cluster;
@@ -285,8 +283,8 @@ pub async fn join(
             while attempt < cluster.max_mesh_ip_attempts {
                 let peer = MeshPeer {
                     node_id: node_id.clone(),
-                    public_key: public_key.to_string(),
-                    mesh_ip: mesh::mesh_ip(cluster.mesh_subnet, node_id, attempt),
+                    public_key: public_key.clone(),
+                    mesh_ip: cluster.mesh_subnet.mesh_ip(node_id, attempt),
                     endpoint,
                 };
                 let request = JoinRequest {

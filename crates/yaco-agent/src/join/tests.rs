@@ -14,7 +14,7 @@ const KEY_NODE_2_RESTARTED: &str = "VVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVU=
 fn peer(node_id: &str, public_key: &str, mesh_ip: [u8; 4]) -> MeshPeer {
     MeshPeer {
         node_id: node_id.to_string(),
-        public_key: public_key.to_string(),
+        public_key: Key::try_from(public_key).unwrap(),
         mesh_ip: Ipv4Addr::from(mesh_ip),
         endpoint: "192.0.2.1:7281".parse().unwrap(),
     }
@@ -86,7 +86,6 @@ fn malformed_requests_are_refused() {
     };
 
     assert!(bad(request("", KEY_NODE_2, [10, 42, 0, 2])));
-    assert!(bad(request("node-2", "not a key", [10, 42, 0, 2])));
     assert!(bad(request("node-2", KEY_NODE_2, [192, 0, 2, 1])));
     assert!(bad(request("node-2", KEY_NODE_2, [10, 42, 0, 0])));
 }
@@ -132,6 +131,14 @@ fn messages_round_trip_as_json() {
         serde_json::from_str::<JoinResponse>(&json).unwrap(),
         response
     );
+}
+
+#[test]
+fn request_with_a_bad_key_does_not_parse() {
+    let json = serde_json::to_string(&request("node-2", KEY_NODE_2, [10, 42, 0, 2])).unwrap();
+    let bad = json.replace(KEY_NODE_2, "not a key");
+    assert_ne!(bad, json);
+    assert!(serde_json::from_str::<JoinRequest>(&bad).is_err());
 }
 
 #[test]

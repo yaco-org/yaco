@@ -21,11 +21,11 @@ use std::path::Path;
 use std::time::Duration;
 
 use anyhow::Context;
-use ipnet::Ipv4Net;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
 use crate::join::{BOOT_CLIENT_IP, BOOT_SERVER_IP};
+use crate::mesh::MeshSubnet;
 
 /// Linux limits interface names to 15 bytes.
 const MAX_INTERFACE_NAME_LEN: usize = 15;
@@ -90,7 +90,7 @@ fn default_boot_interface() -> String {
 pub struct ClusterConfig {
     // Mesh.
     /// Subnet of the mesh IPs.
-    pub mesh_subnet: Ipv4Net,
+    pub mesh_subnet: MeshSubnet,
     /// MTU of both WireGuard interfaces.
     pub mtu: u32,
     /// How often the peer list is synchronized without a membership change.
@@ -204,19 +204,11 @@ impl Config {
             "node.mesh_interface and node.boot_interface are the same"
         );
 
+        // `MeshSubnet` checks its own size and host bits when it is parsed.
+        // A mesh node must never get a bootstrap address.
         let mesh_subnet = cluster.mesh_subnet;
-        // A /31 or /32 has no room for host addresses.
         anyhow::ensure!(
-            mesh_subnet.prefix_len() <= 30,
-            "cluster.mesh_subnet {mesh_subnet} is too small, the longest prefix is /30"
-        );
-        anyhow::ensure!(
-            mesh_subnet == mesh_subnet.trunc(),
-            "cluster.mesh_subnet {mesh_subnet} has host bits set, write {}",
-            mesh_subnet.trunc()
-        );
-        anyhow::ensure!(
-            !mesh_subnet.contains(&BOOT_SERVER_IP) && !mesh_subnet.contains(&BOOT_CLIENT_IP),
+            !mesh_subnet.is_host(BOOT_SERVER_IP) && !mesh_subnet.is_host(BOOT_CLIENT_IP),
             "cluster.mesh_subnet {mesh_subnet} contains the bootstrap addresses \
              {BOOT_SERVER_IP} and {BOOT_CLIENT_IP}"
         );

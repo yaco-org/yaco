@@ -26,7 +26,9 @@
 mod tests;
 
 use std::collections::BTreeMap;
+use std::fmt;
 use std::net::{IpAddr, Ipv4Addr, SocketAddr};
+use std::str::FromStr;
 use std::time::Duration;
 
 use anyhow::Context;
@@ -53,8 +55,8 @@ pub const ENDPOINT_KEY: &str = "facts/endpoint";
 pub struct MeshPeer {
     /// The chitchat node ID.
     pub node_id: String,
-    /// Base64, as `wg` prints it.
-    pub public_key: String,
+    /// Base64 in JSON and in the facts, as `wg` prints it.
+    pub public_key: Key,
     pub mesh_ip: Ipv4Addr,
     pub endpoint: SocketAddr,
 }
@@ -66,7 +68,8 @@ impl MeshPeer {
         let public_key = state
             .get(WG_PUBLIC_KEY_KEY)
             .context("missing wg_public_key")?;
-        check_public_key(public_key)?;
+        let public_key =
+            Key::try_from(public_key).map_err(|err| anyhow::anyhow!("bad wg_public_key: {err}"))?;
         let mesh_ip = state
             .get(MESH_IP_KEY)
             .context("missing mesh_ip")?
@@ -79,7 +82,7 @@ impl MeshPeer {
             .context("bad endpoint")?;
         Ok(MeshPeer {
             node_id: state.chitchat_id().node_id.to_string(),
-            public_key: public_key.to_string(),
+            public_key,
             mesh_ip,
             endpoint,
         })
@@ -89,40 +92,86 @@ impl MeshPeer {
     /// The node ID is not a fact: chitchat has it in the node's `ChitchatId`.
     pub fn to_facts(&self) -> Vec<(String, String)> {
         vec![
-            (WG_PUBLIC_KEY_KEY.to_string(), self.public_key.clone()),
+            (WG_PUBLIC_KEY_KEY.to_string(), self.public_key.to_string()),
             (MESH_IP_KEY.to_string(), self.mesh_ip.to_string()),
             (ENDPOINT_KEY.to_string(), self.endpoint.to_string()),
         ]
     }
 }
 
-/// Checks that `public_key` is a base64 WireGuard key.
-pub fn check_public_key(public_key: &str) -> anyhow::Result<()> {
-    Key::try_from(public_key).map_err(|err| anyhow::anyhow!("bad wg_public_key: {err}"))?;
-    Ok(())
-}
-
-/// Returns true if `ip` is a host address in `subnet`:
-/// in the subnet, and neither the subnet address nor the broadcast address.
-pub fn is_mesh_ip(subnet: Ipv4Net, ip: Ipv4Addr) -> bool {
-    subnet.contains(&ip) && ip != subnet.network() && ip != subnet.broadcast()
-}
-
-/// Proposes a mesh IP for a node, in `subnet`.
+/// Subnet of the mesh IPs.
 ///
-/// SHA-256 keeps the result stable across versions and platforms.
-/// The result is a host address: never the subnet address or the broadcast address.
-/// `subnet` must be a /30 or larger, as `Config` makes sure.
-pub fn mesh_ip(subnet: Ipv4Net, node_id: &str, attempt: u32) -> Ipv4Addr {
-    let mut hasher = Sha256::new();
-    hasher.update(node_id.as_bytes());
-    hasher.update(attempt.to_be_bytes());
-    let hash = hasher.finalize();
-    let value = u32::from_be_bytes([hash[0], hash[1], hash[2], hash[3]]);
-    // All addresses of the subnet, minus the subnet address and the broadcast address.
-    let host_count = (1u64 << (32 - subnet.prefix_len())) - 2;
-    let host = 1 + u64::from(value) % host_count;
-    Ipv4Addr::from(u32::from(subnet.network()) + host as u32)
+/// It is a /30 or larger and has no host bits set,
+/// so it always has room for two or more hosts, as `mesh_ip` needs.
+/// In the config file and in JSON it is a string like "10.42.0.0/16".
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(try_from = "Ipv4Net", into = "Ipv4Net")]
+pub struct MeshSubnet(Ipv4Net);
+
+impl TryFrom<Ipv4Net> for MeshSubnet {
+    type Error = anyhow::Error;
+
+    fn try_from(net: Ipv4Net) -> anyhow::Result<MeshSubnet> {
+        // A /31 or /32 has no room for host addresses.
+        anyhow::ensure!(
+            net.prefix_len() <= 30,
+            "mesh subnet {net} is too small, the longest prefix is /30"
+        );
+        anyhow::ensure!(
+            net == net.trunc(),
+            "mesh subnet {net} has host bits set, write {}",
+            net.trunc()
+        );
+        Ok(MeshSubnet(net))
+    }
+}
+
+impl From<MeshSubnet> for Ipv4Net {
+    fn from(subnet: MeshSubnet) -> Ipv4Net {
+        subnet.0
+    }
+}
+
+impl FromStr for MeshSubnet {
+    type Err = anyhow::Error;
+
+    fn from_str(text: &str) -> anyhow::Result<MeshSubnet> {
+        let net: Ipv4Net = text.parse()?;
+        MeshSubnet::try_from(net)
+    }
+}
+
+impl fmt::Display for MeshSubnet {
+    fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
+        self.0.fmt(f)
+    }
+}
+
+impl MeshSubnet {
+    pub fn prefix_len(&self) -> u8 {
+        self.0.prefix_len()
+    }
+
+    /// Returns true if `ip` is a host address in the subnet:
+    /// in the subnet, and neither the subnet address nor the broadcast address.
+    pub fn is_host(&self, ip: Ipv4Addr) -> bool {
+        self.0.contains(&ip) && ip != self.0.network() && ip != self.0.broadcast()
+    }
+
+    /// Proposes a mesh IP for a node.
+    ///
+    /// SHA-256 keeps the result stable across versions and platforms.
+    pub fn mesh_ip(&self, node_id: &str, attempt: u32) -> Ipv4Addr {
+        let mut hasher = Sha256::new();
+        hasher.update(node_id.as_bytes());
+        hasher.update(attempt.to_be_bytes());
+        let hash = hasher.finalize();
+        let value = u32::from_be_bytes([hash[0], hash[1], hash[2], hash[3]]);
+        // All addresses of the subnet, minus the subnet address and the broadcast address.
+        let host_count = (1u64 << (32 - self.0.prefix_len())) - 2;
+        let host = 1 + u64::from(value) % host_count;
+        Ipv4Addr::from(u32::from(self.0.network()) + host as u32)
+    }
 }
 
 /// Keeps only the latest generation of every node ID.
@@ -274,9 +323,7 @@ impl Mesh {
     }
 
     fn configure_peer(&self, peer: &MeshPeer) -> anyhow::Result<()> {
-        let key = Key::try_from(peer.public_key.as_str())
-            .map_err(|err| anyhow::anyhow!("bad public key: {err}"))?;
-        let mut wg_peer = Peer::new(key);
+        let mut wg_peer = Peer::new(peer.public_key.clone());
         wg_peer.preshared_key = Some(self.psk.clone());
         wg_peer.endpoint = Some(peer.endpoint);
         wg_peer.allowed_ips = vec![IpAddrMask::host(IpAddr::V4(peer.mesh_ip))];
@@ -290,7 +337,7 @@ impl Mesh {
         if !self.peers.iter().any(|p| p.public_key == peer.public_key) {
             return;
         }
-        match self.remove_key(&peer.public_key) {
+        match self.api.remove_peer(&peer.public_key) {
             Ok(()) => {
                 tracing::info!(node_id = %peer.node_id, public_key = %peer.public_key, "removed mesh peer")
             }
@@ -299,13 +346,6 @@ impl Mesh {
             }
         }
         self.peers.retain(|p| p.public_key != peer.public_key);
-    }
-
-    fn remove_key(&self, public_key: &str) -> anyhow::Result<()> {
-        let key =
-            Key::try_from(public_key).map_err(|err| anyhow::anyhow!("bad public key: {err}"))?;
-        self.api.remove_peer(&key)?;
-        Ok(())
     }
 
     /// Removes the mesh interface.

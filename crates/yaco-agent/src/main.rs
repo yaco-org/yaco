@@ -41,7 +41,7 @@ async fn main() -> anyhow::Result<()> {
 
     // A new key on every start. Storing it on disk is a later step.
     let private_key = Key::generate();
-    let public_key = private_key.public_key().to_string();
+    let public_key = private_key.public_key();
     let endpoint = SocketAddr::new(config.node.public_ip, config.node.mesh_port);
     let boot = Bootstrap::create(&config)?;
     // Pending peers to `mesh::sync_peers`, and all peers of this node back to the join server.
@@ -53,7 +53,7 @@ async fn main() -> anyhow::Result<()> {
         let own_facts = MeshPeer {
             node_id: config.node.id.clone(),
             public_key,
-            mesh_ip: mesh::mesh_ip(config.cluster.mesh_subnet, &config.node.id, 0),
+            mesh_ip: config.cluster.mesh_subnet.mesh_ip(&config.node.id, 0),
             endpoint,
         };
         (own_facts, Vec::new(), Vec::new())

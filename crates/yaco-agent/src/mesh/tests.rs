@@ -11,14 +11,14 @@ const KEY_NODE_1_RESTARTED: &str = "VVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVU=
 
 /// The tests use their own subnets, not the default of the config,
 /// so a change of the default does not break them.
-fn subnet(text: &str) -> Ipv4Net {
+fn subnet(text: &str) -> MeshSubnet {
     text.parse().unwrap()
 }
 
 fn peer(node_id: &str, public_key: &str, mesh_ip: [u8; 4]) -> MeshPeer {
     MeshPeer {
         node_id: node_id.to_string(),
-        public_key: public_key.to_string(),
+        public_key: Key::try_from(public_key).unwrap(),
         mesh_ip: Ipv4Addr::from(mesh_ip),
         endpoint: "192.0.2.1:7281".parse().unwrap(),
     }
@@ -28,13 +28,13 @@ fn peer(node_id: &str, public_key: &str, mesh_ip: [u8; 4]) -> MeshPeer {
 fn mesh_ip_is_stable() {
     // If these values change, nodes get new addresses after an upgrade.
     let net = subnet("10.42.0.0/16");
-    assert_eq!(mesh_ip(net, "node-1", 0), Ipv4Addr::new(10, 42, 58, 124));
+    assert_eq!(net.mesh_ip("node-1", 0), Ipv4Addr::new(10, 42, 58, 124));
     assert_eq!(
-        mesh_ip(subnet("192.168.0.0/24"), "node-1", 0),
+        subnet("192.168.0.0/24").mesh_ip("node-1", 0),
         Ipv4Addr::new(192, 168, 0, 140)
     );
-    assert_ne!(mesh_ip(net, "node-1", 0), mesh_ip(net, "node-1", 1));
-    assert_ne!(mesh_ip(net, "node-1", 0), mesh_ip(net, "node-2", 0));
+    assert_ne!(net.mesh_ip("node-1", 0), net.mesh_ip("node-1", 1));
+    assert_ne!(net.mesh_ip("node-1", 0), net.mesh_ip("node-2", 0));
 }
 
 #[test]
@@ -47,8 +47,8 @@ fn mesh_ip_is_a_host_in_the_subnet() {
     ] {
         let net = subnet(text);
         for attempt in 0..10_000 {
-            let ip = mesh_ip(net, "node", attempt);
-            assert!(is_mesh_ip(net, ip), "{text}, attempt {attempt}: {ip}");
+            let ip = net.mesh_ip("node", attempt);
+            assert!(net.is_host(ip), "{text}, attempt {attempt}: {ip}");
         }
     }
 }
@@ -57,7 +57,7 @@ fn mesh_ip_is_a_host_in_the_subnet() {
 fn mesh_ip_uses_both_hosts_of_a_30() {
     let net = subnet("10.0.0.8/30");
     let ips: std::collections::BTreeSet<Ipv4Addr> = (0..100)
-        .map(|attempt| mesh_ip(net, "node", attempt))
+        .map(|attempt| net.mesh_ip("node", attempt))
         .collect();
     assert_eq!(
         ips.into_iter().collect::<Vec<_>>(),
@@ -66,14 +66,35 @@ fn mesh_ip_uses_both_hosts_of_a_30() {
 }
 
 #[test]
-fn is_mesh_ip_accepts_hosts_only() {
+fn subnet_without_room_for_hosts_or_with_host_bits_is_refused() {
+    assert!("10.42.0.0/30".parse::<MeshSubnet>().is_ok());
+    assert!("10.42.0.0/31".parse::<MeshSubnet>().is_err());
+    assert!("10.42.0.1/32".parse::<MeshSubnet>().is_err());
+    assert!("10.42.1.0/16".parse::<MeshSubnet>().is_err());
+    assert!("not a subnet".parse::<MeshSubnet>().is_err());
+}
+
+#[test]
+fn subnet_is_a_plain_string_in_json() {
+    // The config fingerprint depends on this form.
     let net = subnet("10.42.0.0/16");
-    assert!(is_mesh_ip(net, Ipv4Addr::new(10, 42, 0, 1)));
-    assert!(is_mesh_ip(net, Ipv4Addr::new(10, 42, 255, 254)));
-    assert!(!is_mesh_ip(net, Ipv4Addr::new(10, 42, 0, 0)));
-    assert!(!is_mesh_ip(net, Ipv4Addr::new(10, 42, 255, 255)));
-    assert!(!is_mesh_ip(net, Ipv4Addr::new(10, 43, 0, 1)));
-    assert!(!is_mesh_ip(net, Ipv4Addr::new(10, 41, 255, 254)));
+    assert_eq!(serde_json::to_string(&net).unwrap(), "\"10.42.0.0/16\"");
+    assert_eq!(
+        serde_json::from_str::<MeshSubnet>("\"10.42.0.0/16\"").unwrap(),
+        net
+    );
+    assert!(serde_json::from_str::<MeshSubnet>("\"10.42.1.0/16\"").is_err());
+}
+
+#[test]
+fn is_host_accepts_hosts_only() {
+    let net = subnet("10.42.0.0/16");
+    assert!(net.is_host(Ipv4Addr::new(10, 42, 0, 1)));
+    assert!(net.is_host(Ipv4Addr::new(10, 42, 255, 254)));
+    assert!(!net.is_host(Ipv4Addr::new(10, 42, 0, 0)));
+    assert!(!net.is_host(Ipv4Addr::new(10, 42, 255, 255)));
+    assert!(!net.is_host(Ipv4Addr::new(10, 43, 0, 1)));
+    assert!(!net.is_host(Ipv4Addr::new(10, 41, 255, 254)));
 }
 
 mod from_node_state {
