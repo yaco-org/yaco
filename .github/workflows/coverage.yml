@@ -1,0 +1,65 @@
+# Runs the tests with cargo-tarpaulin (the `cargo cov` alias in .cargo/config.toml)
+# and publishes the HTML report at /coverage on the gh-pages branch.
+# The netns test is ignored by default, so its code counts as not covered.
+
+name: Coverage
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - "crates/**/*.rs"
+      - "crates/**/Cargo.toml"
+      - "Cargo.toml"
+      - "Cargo.lock"
+      - ".cargo/**"
+      - ".github/workflows/coverage.yml"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  coverage:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: "1.98"
+      - uses: Swatinem/rust-cache@v2
+      - uses: taiki-e/install-action@v2
+        with:
+          tool: cargo-tarpaulin
+      - name: Run the tests with coverage
+        run: cargo cov --locked
+      - name: Collect the report
+        run: |
+          mkdir coverage
+          cp target/coverage/tarpaulin-report.html coverage/index.html
+      - uses: actions/upload-artifact@v7
+        with:
+          name: coverage
+          path: coverage
+
+  # Commits the report to /coverage on the gh-pages branch.
+  deploy:
+    if: github.ref == 'refs/heads/main'
+    needs: coverage
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    concurrency:
+      group: gh-pages
+      cancel-in-progress: false
+    steps:
+      - uses: actions/download-artifact@v8
+        with:
+          name: coverage
+          path: coverage
+      - uses: peaceiris/actions-gh-pages@v4
+        with:
+          github_token: ${{ secrets.GITHUB_TOKEN }}
+          publish_branch: gh-pages
+          publish_dir: coverage
+          destination_dir: coverage

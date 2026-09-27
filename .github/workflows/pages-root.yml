@@ -1,0 +1,32 @@
+# Publishes the root page (.github/pages/index.html) on the gh-pages branch.
+# The pages under /api and /coverage come from their own workflows.
+
+name: Pages root
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - ".github/pages/**"
+      - ".github/workflows/pages-root.yml"
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+concurrency:
+  group: gh-pages
+  cancel-in-progress: false
+
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - uses: peaceiris/actions-gh-pages@v4
+        with:
+          github_token: ${{ secrets.GITHUB_TOKEN }}
+          publish_dir: .github/pages
+          # The root is the whole branch.
+          # Without this, the deploy would delete /api and /coverage.
+          keep_files: true

@@ -24,30 +24,34 @@ jobs:
         with:
           toolchain: "1.98"
       - uses: Swatinem/rust-cache@v2
-      # The site root stays free for other pages, for example coverage results.
       - name: Render the spec
         run: |
-          mkdir -p site/api
-          cargo run --locked -p yaco-api --example openapi > site/api/openapi.json
-          cp crates/yaco-api/pages/index.html site/api/
-      - uses: actions/upload-pages-artifact@v5
+          mkdir api
+          cargo run --locked -p yaco-api --example openapi > api/openapi.json
+          cp crates/yaco-api/pages/index.html api/
+      - uses: actions/upload-artifact@v7
         with:
-          path: site
+          name: api
+          path: api
 
+  # Commits the page to /api on the gh-pages branch.
   deploy:
     if: github.event_name != 'pull_request' && github.ref == 'refs/heads/main'
     needs: render
     runs-on: ubuntu-latest
     permissions:
-      pages: write
-      id-token: write
-    environment:
-      name: github-pages
-      url: ${{ steps.deployment.outputs.page_url }}
-    # Only one deployment at a time. A newer push replaces a waiting one.
+      contents: write
     concurrency:
-      group: pages
-      cancel-in-progress: true
+      group: gh-pages
+      cancel-in-progress: false
     steps:
-      - id: deployment
-        uses: actions/deploy-pages@v5
+      - uses: actions/download-artifact@v8
+        with:
+          name: api
+          path: api
+      - uses: peaceiris/actions-gh-pages@v4
+        with:
+          github_token: ${{ secrets.GITHUB_TOKEN }}
+          publish_branch: gh-pages
+          publish_dir: api
+          destination_dir: api
