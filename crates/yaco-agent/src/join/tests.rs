@@ -11,8 +11,9 @@ const KEY_NODE_4: &str = "REREREREREREREREREREREREREREREREREREREREREQ=";
 /// The new key of `node-2` after a restart.
 const KEY_NODE_2_RESTARTED: &str = "VVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVU=";
 
-fn peer(public_key: &str, mesh_ip: [u8; 4]) -> MeshPeer {
+fn peer(node_id: &str, public_key: &str, mesh_ip: [u8; 4]) -> MeshPeer {
     MeshPeer {
+        node_id: node_id.to_string(),
         public_key: public_key.to_string(),
         mesh_ip: Ipv4Addr::from(mesh_ip),
         endpoint: "192.0.2.1:7281".parse().unwrap(),
@@ -31,15 +32,14 @@ fn cluster() -> ClusterConfig {
 /// A join request of `node_id` with the config of `cluster()`.
 fn request(node_id: &str, public_key: &str, mesh_ip: [u8; 4]) -> JoinRequest {
     JoinRequest {
-        node_id: node_id.to_string(),
         config_fingerprint: cluster().fingerprint(),
-        peer: peer(public_key, mesh_ip),
+        peer: peer(node_id, public_key, mesh_ip),
     }
 }
 
 #[test]
 fn free_mesh_ip_is_accepted() {
-    let members = vec![peer(KEY_NODE_1, [10, 42, 0, 1])];
+    let members = vec![peer("node-1", KEY_NODE_1, [10, 42, 0, 1])];
     assert_eq!(
         check_join(
             &request("node-2", KEY_NODE_2, [10, 42, 0, 2]),
@@ -52,7 +52,7 @@ fn free_mesh_ip_is_accepted() {
 
 #[test]
 fn used_mesh_ip_is_a_conflict() {
-    let members = vec![peer(KEY_NODE_1, [10, 42, 0, 1])];
+    let members = vec![peer("node-1", KEY_NODE_1, [10, 42, 0, 1])];
     assert_eq!(
         check_join(
             &request("node-2", KEY_NODE_2, [10, 42, 0, 1]),
@@ -65,7 +65,7 @@ fn used_mesh_ip_is_a_conflict() {
 
 #[test]
 fn retried_join_of_the_same_node_is_accepted() {
-    let members = vec![peer(KEY_NODE_2, [10, 42, 0, 2])];
+    let members = vec![peer("node-2", KEY_NODE_2, [10, 42, 0, 2])];
     assert_eq!(
         check_join(
             &request("node-2", KEY_NODE_2, [10, 42, 0, 2]),
@@ -124,7 +124,7 @@ fn messages_round_trip_as_json() {
     assert_eq!(serde_json::from_str::<JoinRequest>(&json).unwrap(), request);
 
     let response = JoinResponse {
-        members: vec![peer(KEY_NODE_1, [10, 42, 0, 1])],
+        members: vec![peer("node-1", KEY_NODE_1, [10, 42, 0, 1])],
         gossip_seed: "192.0.2.1:7280".parse().unwrap(),
     };
     let json = serde_json::to_string(&response).unwrap();
@@ -150,122 +150,159 @@ fn jitter_adds_up_to_the_same_delay() {
 /// | Node   | Role               | Mesh IP   | Key          |
 /// |--------|--------------------|-----------|--------------|
 /// | node-1 | the seed           | 10.42.0.1 | `KEY_NODE_1` |
-/// | node-2 | known to the seed  | 10.42.0.2 | `KEY_NODE_2` |
+/// | node-2 | a peer of the seed | 10.42.0.2 | `KEY_NODE_2` |
 ///
 /// `node-3` and `node-4` are new nodes that join.
 mod handle_join {
     use super::*;
-    use crate::test_util::{chitchat_id, chitchat_with_nodes};
 
-    fn seed() -> Arc<JoinServer> {
+    /// The join server of node-1, and the two ends of the channels
+    /// that `mesh::sync_peers` has in the agent.
+    struct Seed {
+        server: Arc<JoinServer>,
+        new_peers: mpsc::UnboundedReceiver<MeshPeer>,
+        peers: watch::Sender<Vec<MeshPeer>>,
+    }
+
+    fn seed() -> Seed {
         let mut config =
             Config::parse("[node]\nid = \"node-1\"\npublic_ip = \"192.0.2.1\"\n").unwrap();
         config.cluster = cluster();
 
-        let self_id = chitchat_id("node-1", 1);
-        let own = peer(KEY_NODE_1, [10, 42, 0, 1]);
-        let node_2 = peer(KEY_NODE_2, [10, 42, 0, 2]);
-        let chitchat = chitchat_with_nodes(
-            &self_id,
-            own.to_facts(),
-            vec![(chitchat_id("node-2", 1), node_2.to_facts())],
-        );
-
-        Arc::new(JoinServer {
-            pending: Arc::new(PendingPeers::new(config.cluster.pending_peer_ttl)),
+        let (new_peers_tx, new_peers) = mpsc::unbounded_channel();
+        let (peers, peers_rx) = watch::channel(vec![peer("node-2", KEY_NODE_2, [10, 42, 0, 2])]);
+        let server = Arc::new(JoinServer {
             config,
-            chitchat: Arc::new(Mutex::new(chitchat)),
-            self_id,
-            own,
-        })
+            own: peer("node-1", KEY_NODE_1, [10, 42, 0, 1]),
+            new_peers: new_peers_tx,
+            peers: peers_rx,
+        });
+        Seed {
+            server,
+            new_peers,
+            peers,
+        }
     }
 
     /// Calls the handler, and returns the response or the status of the refusal.
-    async fn call(
-        server: &Arc<JoinServer>,
-        request: JoinRequest,
-    ) -> Result<JoinResponse, StatusCode> {
-        handle_join(State(server.clone()), Json(request))
+    async fn call(seed: &Seed, request: JoinRequest) -> Result<JoinResponse, StatusCode> {
+        handle_join(State(seed.server.clone()), Json(request))
             .await
             .map(|Json(response)| response)
             .map_err(|(status, _)| status)
     }
 
+    fn mesh_ips(response: &JoinResponse) -> Vec<Ipv4Addr> {
+        let mut ips: Vec<Ipv4Addr> = response.members.iter().map(|m| m.mesh_ip).collect();
+        ips.sort();
+        ips
+    }
+
     #[tokio::test]
-    async fn accepted_join_returns_the_members_and_adds_a_pending_peer() {
-        let server = seed();
+    async fn accepted_join_returns_the_members_and_sends_the_new_peer() {
+        let mut seed = seed();
         let request = request("node-3", KEY_NODE_3, [10, 42, 0, 3]);
 
-        let response = call(&server, request.clone()).await.unwrap();
+        let response = call(&seed, request.clone()).await.unwrap();
 
-        let mut mesh_ips: Vec<Ipv4Addr> = response.members.iter().map(|m| m.mesh_ip).collect();
-        mesh_ips.sort();
         assert_eq!(
-            mesh_ips,
+            mesh_ips(&response),
             vec![Ipv4Addr::new(10, 42, 0, 1), Ipv4Addr::new(10, 42, 0, 2)]
         );
-        assert_eq!(response.gossip_seed, server.self_id.gossip_advertise_addr);
-        assert_eq!(server.pending.current(&[]), vec![request.peer]);
+        let gossip_port = seed.server.config.cluster.gossip_port;
+        assert_eq!(
+            response.gossip_seed,
+            SocketAddr::new(IpAddr::V4(Ipv4Addr::new(10, 42, 0, 1)), gossip_port)
+        );
+        assert_eq!(seed.new_peers.try_recv(), Ok(request.peer));
     }
 
     #[tokio::test]
     async fn other_config_is_a_bad_request() {
-        let server = seed();
+        let mut seed = seed();
         let mut other = cluster();
         other.mtu -= 1;
         let mut request = request("node-3", KEY_NODE_3, [10, 42, 0, 3]);
         request.config_fingerprint = other.fingerprint();
 
-        assert_eq!(call(&server, request).await, Err(StatusCode::BAD_REQUEST));
-        assert!(server.pending.current(&[]).is_empty());
+        assert_eq!(call(&seed, request).await, Err(StatusCode::BAD_REQUEST));
+        assert!(seed.new_peers.try_recv().is_err());
     }
 
     #[tokio::test]
     async fn malformed_request_is_a_bad_request() {
-        let server = seed();
+        let mut seed = seed();
         // Outside the mesh subnet.
         let request = request("node-3", KEY_NODE_3, [192, 0, 2, 3]);
 
-        assert_eq!(call(&server, request).await, Err(StatusCode::BAD_REQUEST));
-        assert!(server.pending.current(&[]).is_empty());
+        assert_eq!(call(&seed, request).await, Err(StatusCode::BAD_REQUEST));
+        assert!(seed.new_peers.try_recv().is_err());
     }
 
     #[tokio::test]
-    async fn mesh_ip_of_the_seed_or_a_known_node_is_a_conflict() {
-        let server = seed();
+    async fn mesh_ip_of_the_seed_or_a_peer_is_a_conflict() {
+        let mut seed = seed();
         for taken in [[10, 42, 0, 1], [10, 42, 0, 2]] {
             let request = request("node-3", KEY_NODE_3, taken);
             assert_eq!(
-                call(&server, request).await,
+                call(&seed, request).await,
                 Err(StatusCode::CONFLICT),
                 "{taken:?}"
             );
         }
+        assert!(seed.new_peers.try_recv().is_err());
     }
 
     #[tokio::test]
-    async fn mesh_ip_of_a_pending_peer_is_a_conflict() {
-        let server = seed();
-        // node-3 joins. Gossip does not have it yet, so it is only a pending peer.
-        call(&server, request("node-3", KEY_NODE_3, [10, 42, 0, 3]))
+    async fn node_that_just_joined_counts_after_the_peer_sync() {
+        let mut seed = seed();
+        // node-3 joins.
+        call(&seed, request("node-3", KEY_NODE_3, [10, 42, 0, 3]))
             .await
             .unwrap();
+        // The peer sync adds node-3 as a pending peer,
+        // and sends all peers back to the join server.
+        let node_3 = seed.new_peers.try_recv().unwrap();
+        seed.peers.send_modify(|peers| peers.push(node_3));
 
-        // node-4 proposes the same IP.
-        let request = request("node-4", KEY_NODE_4, [10, 42, 0, 3]);
-        assert_eq!(call(&server, request).await, Err(StatusCode::CONFLICT));
+        // node-4 proposes the IP of node-3.
+        let taken = request("node-4", KEY_NODE_4, [10, 42, 0, 3]);
+        assert_eq!(call(&seed, taken).await, Err(StatusCode::CONFLICT));
+
+        // node-4 proposes a free IP and gets node-3 as a member.
+        let free = request("node-4", KEY_NODE_4, [10, 42, 0, 4]);
+        let response = call(&seed, free).await.unwrap();
+        assert_eq!(
+            mesh_ips(&response),
+            vec![
+                Ipv4Addr::new(10, 42, 0, 1),
+                Ipv4Addr::new(10, 42, 0, 2),
+                Ipv4Addr::new(10, 42, 0, 3)
+            ]
+        );
     }
 
     #[tokio::test]
     async fn restarted_node_gets_its_old_mesh_ip_back() {
-        let server = seed();
+        let seed = seed();
         // node-2 restarted with a new key and proposes the IP of its old generation.
         let request = request("node-2", KEY_NODE_2_RESTARTED, [10, 42, 0, 2]);
 
-        let response = call(&server, request).await.unwrap();
+        let response = call(&seed, request).await.unwrap();
         assert!(
-            response.members.iter().all(|m| m.public_key != KEY_NODE_2),
+            response.members.iter().all(|m| m.node_id != "node-2"),
             "the old generation of node-2 is not a member"
         );
+    }
+
+    #[tokio::test]
+    async fn stopped_peer_sync_is_an_error() {
+        let seed = seed();
+        drop(seed.new_peers);
+        let server = seed.server.clone();
+        let request = request("node-3", KEY_NODE_3, [10, 42, 0, 3]);
+
+        let result = handle_join(State(server), Json(request)).await;
+        assert!(matches!(result, Err((StatusCode::SERVICE_UNAVAILABLE, _))));
     }
 }

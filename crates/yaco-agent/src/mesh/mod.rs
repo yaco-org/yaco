@@ -3,11 +3,17 @@
 //! chitchat runs over the mesh.
 //!
 //! Every node publishes its WireGuard facts in its own chitchat namespace.
-//! Every node makes its peer list from the facts of all nodes that chitchat knows.
 //!
-//! A node that joins gets its first peers from the join response (see `join`),
-//! before gossip has them. `PendingPeers` keeps those peers configured
-//! until they appear in gossip.
+//! `sync_peers` configures new peers from two sources:
+//!
+//! - gossip: the nodes that are new or changed since the last gossip view;
+//! - a channel: on a joining node, the members from the join response;
+//!   on a seed, the node that just joined (see `join`).
+//!   These nodes are not in gossip yet.
+//!
+//! Both sources put the peers into one queue, and `sync_peers` configures them one by one.
+//! Only a node that disappears from gossip removes a peer,
+//! so a peer from the channel stays until gossip has it.
 //!
 //! A dead node keeps its peer so that if it came back
 //! (after network connection is restored, for example),
@@ -21,11 +27,10 @@ mod tests;
 
 use std::collections::BTreeMap;
 use std::net::{IpAddr, Ipv4Addr, SocketAddr};
-use std::sync::Mutex;
-use std::time::{Duration, Instant};
+use std::time::Duration;
 
 use anyhow::Context;
-use chitchat::{ChitchatHandle, ChitchatId, NodeState};
+use chitchat::{Chitchat, ChitchatHandle, ChitchatId, NodeState};
 use defguard_wireguard_rs::key::Key;
 use defguard_wireguard_rs::net::IpAddrMask;
 use defguard_wireguard_rs::peer::Peer;
@@ -33,7 +38,7 @@ use defguard_wireguard_rs::{InterfaceConfiguration, Kernel, WGApi, WireguardInte
 use ipnet::Ipv4Net;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
-use tokio::sync::Notify;
+use tokio::sync::{mpsc, watch};
 
 use crate::config::Config;
 use crate::gossip::LEAVING_KEY;
@@ -43,9 +48,11 @@ pub const WG_PUBLIC_KEY_KEY: &str = "facts/wg_public_key";
 pub const MESH_IP_KEY: &str = "facts/mesh_ip";
 pub const ENDPOINT_KEY: &str = "facts/endpoint";
 
-/// One remote node, as the WireGuard peer list needs it.
+/// One node of the mesh, as the WireGuard peer list needs it.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct MeshPeer {
+    /// The chitchat node ID.
+    pub node_id: String,
     /// Base64, as `wg` prints it.
     pub public_key: String,
     pub mesh_ip: Ipv4Addr,
@@ -53,24 +60,25 @@ pub struct MeshPeer {
 }
 
 impl MeshPeer {
-    /// Parses the facts of one node.
+    /// Parses the facts of one node from its chitchat state.
     /// Received data can be malformed, so this never panics.
-    pub fn from_facts(
-        public_key: Option<&str>,
-        mesh_ip: Option<&str>,
-        endpoint: Option<&str>,
-    ) -> anyhow::Result<MeshPeer> {
-        let public_key = public_key.context("missing wg_public_key")?;
+    pub fn from_node_state(state: &NodeState) -> anyhow::Result<MeshPeer> {
+        let public_key = state
+            .get(WG_PUBLIC_KEY_KEY)
+            .context("missing wg_public_key")?;
         check_public_key(public_key)?;
-        let mesh_ip = mesh_ip
+        let mesh_ip = state
+            .get(MESH_IP_KEY)
             .context("missing mesh_ip")?
             .parse()
             .context("bad mesh_ip")?;
-        let endpoint = endpoint
+        let endpoint = state
+            .get(ENDPOINT_KEY)
             .context("missing endpoint")?
             .parse()
             .context("bad endpoint")?;
         Ok(MeshPeer {
+            node_id: state.chitchat_id().node_id.to_string(),
             public_key: public_key.to_string(),
             mesh_ip,
             endpoint,
@@ -78,6 +86,7 @@ impl MeshPeer {
     }
 
     /// Returns the facts to publish for this node.
+    /// The node ID is not a fact: chitchat has it in the node's `ChitchatId`.
     pub fn to_facts(&self) -> Vec<(String, String)> {
         vec![
             (WG_PUBLIC_KEY_KEY.to_string(), self.public_key.clone()),
@@ -119,7 +128,7 @@ pub fn mesh_ip(subnet: Ipv4Net, node_id: &str, attempt: u32) -> Ipv4Addr {
 /// Keeps only the latest generation of every node ID.
 /// A restarted node has a new generation (and a new key),
 /// and chitchat keeps the old generation as a dead node for a while.
-pub fn latest_generations<'a, T>(
+fn latest_generations<'a, T>(
     nodes: impl IntoIterator<Item = (&'a ChitchatId, T)>,
 ) -> BTreeMap<String, T> {
     let mut latest: BTreeMap<String, (u64, T)> = BTreeMap::new();
@@ -138,107 +147,54 @@ pub fn latest_generations<'a, T>(
         .collect()
 }
 
-/// Returns the peers of all nodes that chitchat knows, live or dead, by node ID.
-/// Takes the latest generation of every node, skips nodes that left gracefully,
+/// Returns the peers of all other nodes that chitchat knows, live or dead.
+/// Takes the latest generation of every node, skips the own node and nodes that left gracefully,
 /// and skips (with a warning) nodes with bad or missing facts.
-pub fn known_peers(nodes: &BTreeMap<ChitchatId, NodeState>) -> BTreeMap<String, MeshPeer> {
-    let mut peers = BTreeMap::new();
-    for (node_id, state) in latest_generations(nodes) {
-        if state.get(LEAVING_KEY).is_some() {
+fn good_known_peers(chitchat: &Chitchat) -> Vec<MeshPeer> {
+    let own_node_id = &chitchat.self_chitchat_id().node_id;
+    let mut peers = Vec::new();
+    for (node_id, state) in latest_generations(chitchat.node_states()) {
+        // Also skips older generations of this node.
+        if *node_id == **own_node_id || state.get(LEAVING_KEY).is_some() {
             continue;
         }
-        let peer = MeshPeer::from_facts(
-            state.get(WG_PUBLIC_KEY_KEY),
-            state.get(MESH_IP_KEY),
-            state.get(ENDPOINT_KEY),
-        );
-        match peer {
-            Ok(peer) => {
-                peers.insert(node_id, peer);
-            }
+        match MeshPeer::from_node_state(state) {
+            Ok(peer) => peers.push(peer),
             Err(err) => tracing::warn!(%node_id, "skipping node with bad facts: {err:#}"),
         }
     }
     peers
 }
 
-/// Returns the known peers, plus the pending peers that gossip does not have yet.
-/// Skips the own node, which can be in a join response.
-pub fn desired_peers(
-    known: Vec<MeshPeer>,
-    pending: Vec<MeshPeer>,
-    own_public_key: &str,
-) -> Vec<MeshPeer> {
-    let mut peers = known;
-    for peer in pending {
-        let known = peers.iter().any(|p| p.public_key == peer.public_key);
-        if !known && peer.public_key != own_public_key {
-            peers.push(peer);
-        }
-    }
-    peers
+/// Adds a peer to the queue of peers to configure.
+/// Replaces an older queued peer of the same node.
+fn add_pending(pending: &mut Vec<MeshPeer>, peer: MeshPeer) {
+    pending.retain(|p| p.node_id != peer.node_id);
+    pending.push(peer);
 }
 
-/// Peers that are not in gossip yet:
-/// on a seed, the node that just joined;
-/// on a joining node, the members from the join response.
-/// A peer is forgotten when it appears in gossip, or after `ttl`.
-/// From then on, gossip alone decides, so a node that leaves is removed at once.
-pub struct PendingPeers {
-    peers: Mutex<Vec<(MeshPeer, Instant)>>,
-    ttl: Duration,
-    /// Wakes `sync_peers` after `add`.
-    changed: Notify,
+#[derive(Debug, Default, PartialEq, Eq)]
+struct PeersDiff {
+    changed: Vec<MeshPeer>,
+    gone: Vec<MeshPeer>,
 }
 
-impl PendingPeers {
-    pub fn new(ttl: Duration) -> PendingPeers {
-        PendingPeers {
-            peers: Mutex::new(Vec::new()),
-            ttl,
-            changed: Notify::new(),
-        }
-    }
-
-    pub fn add(&self, peers: Vec<MeshPeer>) {
-        let now = Instant::now();
-        {
-            let mut pending = self.peers.lock().unwrap();
-            for peer in peers {
-                pending.retain(|(p, _)| p.public_key != peer.public_key);
-                pending.push((peer, now));
-            }
-        }
-        self.changed.notify_one();
-    }
-
-    /// Forgets the expired peers and the peers in `known`, and returns the others.
-    pub fn current(&self, known: &[MeshPeer]) -> Vec<MeshPeer> {
-        let mut pending = self.peers.lock().unwrap();
-        pending.retain(|(peer, added)| {
-            let is_known = known.iter().any(|k| k.public_key == peer.public_key);
-            added.elapsed() < self.ttl && !is_known
-        });
-        pending.iter().map(|(peer, _)| peer.clone()).collect()
-    }
-}
-
-/// Compares the configured peers with the desired peers.
-/// Returns the peers to add or update, and the public keys to remove.
-pub fn diff_peers<'a>(
-    current: &[MeshPeer],
-    desired: &'a [MeshPeer],
-) -> (Vec<&'a MeshPeer>, Vec<String>) {
-    let to_configure = desired
+/// Compares two gossip views.
+/// Returns the peers that are new or changed in `new`,
+/// and the peers of `old` whose node is not in `new`:
+/// the node left gracefully, or chitchat forgot it.
+fn gossip_changes(old: &[MeshPeer], new: &[MeshPeer]) -> PeersDiff {
+    let changed = new
         .iter()
-        .filter(|peer| !current.contains(peer))
+        .filter(|peer| !old.contains(peer))
+        .cloned()
         .collect();
-    let to_remove = current
+    let gone = old
         .iter()
-        .filter(|old| !desired.iter().any(|new| new.public_key == old.public_key))
-        .map(|old| old.public_key.clone())
+        .filter(|peer| !new.iter().any(|p| p.node_id == peer.node_id))
+        .cloned()
         .collect();
-    (to_configure, to_remove)
+    PeersDiff { changed, gone }
 }
 
 /// The mesh interface of this node.
@@ -246,7 +202,6 @@ pub struct Mesh {
     api: WGApi<Kernel>,
     interface: String,
     psk: Key,
-    public_key: String,
     peers: Vec<MeshPeer>,
 }
 
@@ -286,50 +241,36 @@ impl Mesh {
             api,
             interface,
             psk: psk.clone(),
-            public_key: private_key.public_key().to_string(),
             peers: Vec::new(),
         })
     }
 
-    /// Makes the WireGuard peers equal to `desired`.
-    ///
-    /// A failed change is logged and not recorded,
-    /// so the next call tries it again.
-    pub fn set_peers(&mut self, desired: Vec<MeshPeer>) {
-        let (to_configure, to_remove) = diff_peers(&self.peers, &desired);
-        let mut applied = Vec::new();
+    /// The configured peers.
+    pub fn peers(&self) -> &[MeshPeer] {
+        &self.peers
+    }
 
-        for public_key in &to_remove {
-            match self.remove_peer(public_key) {
-                Ok(()) => tracing::info!(%public_key, "removed mesh peer"),
-                Err(err) => {
-                    tracing::error!(%public_key, "cannot remove mesh peer: {err:#}");
-                    let old = self.peers.iter().find(|p| &p.public_key == public_key);
-                    applied.extend(old.cloned());
-                }
-            }
+    /// Configures `peer`.
+    /// Removes the old peer of the same node if its key is different,
+    /// for example after a restart.
+    pub fn add_peer(&mut self, peer: &MeshPeer) -> anyhow::Result<()> {
+        if self.peers.contains(peer) {
+            return Ok(());
         }
+        self.configure_peer(peer)?;
+        tracing::info!(node_id = %peer.node_id, mesh_ip = %peer.mesh_ip, endpoint = %peer.endpoint, "configured mesh peer");
 
-        // Building a new list of current peers from current peers and new peers
-        for peer in &desired {
-            if !to_configure.contains(&peer) {
-                // If a peer is already present just add it to the list
-                applied.push(peer.clone());
-                continue;
-            }
-            // Otherwise, configure
-            match self.configure_peer(peer) {
-                Ok(()) => {
-                    tracing::info!(mesh_ip = %peer.mesh_ip, endpoint = %peer.endpoint, "configured mesh peer");
-                    applied.push(peer.clone());
-                }
-                Err(err) => {
-                    tracing::error!(mesh_ip = %peer.mesh_ip, "cannot configure mesh peer: {err:#}")
-                }
-            }
+        let old = self
+            .peers
+            .iter()
+            .find(|p| p.node_id == peer.node_id && p.public_key != peer.public_key)
+            .cloned();
+        if let Some(old) = old {
+            self.remove_peer(&old);
         }
-
-        self.peers = applied;
+        self.peers.retain(|p| p.node_id != peer.node_id);
+        self.peers.push(peer.clone());
+        Ok(())
     }
 
     fn configure_peer(&self, peer: &MeshPeer) -> anyhow::Result<()> {
@@ -343,7 +284,24 @@ impl Mesh {
         Ok(())
     }
 
-    fn remove_peer(&self, public_key: &str) -> anyhow::Result<()> {
+    /// Removes `peer` if it is configured with the same key.
+    /// A failure is only logged.
+    pub fn remove_peer(&mut self, peer: &MeshPeer) {
+        if !self.peers.iter().any(|p| p.public_key == peer.public_key) {
+            return;
+        }
+        match self.remove_key(&peer.public_key) {
+            Ok(()) => {
+                tracing::info!(node_id = %peer.node_id, public_key = %peer.public_key, "removed mesh peer")
+            }
+            Err(err) => {
+                tracing::error!(node_id = %peer.node_id, "cannot remove mesh peer: {err:#}")
+            }
+        }
+        self.peers.retain(|p| p.public_key != peer.public_key);
+    }
+
+    fn remove_key(&self, public_key: &str) -> anyhow::Result<()> {
         let key =
             Key::try_from(public_key).map_err(|err| anyhow::anyhow!("bad public key: {err}"))?;
         self.api.remove_peer(&key)?;
@@ -365,38 +323,65 @@ impl Mesh {
     }
 }
 
-/// Keeps the WireGuard peers equal to the known nodes plus the pending peers.
-/// Updates on every change of the live set, on every new pending peer,
-/// and also every `resync_interval`: to retry failed changes,
-/// to drop expired pending peers, and to drop dead nodes that chitchat forgot.
+/// Configures the peers from gossip and from the channel `new_peers`,
+/// and removes the peers of nodes that disappear from gossip.
+///
+/// `new_peers` brings the peers that are not in gossip yet:
+/// from `main` after a join, and from the join server for every accepted node.
+/// After every update, `peers` gets all peers of this node, queued ones included,
+/// for the mesh IP check and the response of the join server.
+///
+/// Updates on every change of the live set, on every new peer from the channel,
+/// and also every `resync_interval`: to retry failed peers,
+/// and to remove dead nodes that chitchat forgot.
 /// Returns when chitchat stops.
 pub async fn sync_peers(
     handle: &ChitchatHandle,
     mesh: &mut Mesh,
-    pending: &PendingPeers,
+    mut new_peers: mpsc::UnboundedReceiver<MeshPeer>,
+    peers: watch::Sender<Vec<MeshPeer>>,
     resync_interval: Duration,
 ) {
-    let own_node_id = handle.chitchat_id().node_id.to_string();
+    // Peers to configure.
+    let mut pending: Vec<MeshPeer> = Vec::new();
+    // The gossip view of the last update.
+    let mut last_known: Vec<MeshPeer> = Vec::new();
     let mut watcher = handle.chitchat().lock().await.live_nodes_watcher();
     loop {
         // The live set is only the trigger. Mark it as seen.
         watcher.borrow_and_update();
-        let nodes = handle.chitchat().lock().await.node_states().clone();
-        let mut known = known_peers(&nodes);
-        // Also removes older generations of this node.
-        known.remove(&own_node_id);
-        let known: Vec<MeshPeer> = known.into_values().collect();
-        let not_known = pending.current(&known);
-        mesh.set_peers(desired_peers(known, not_known, &mesh.public_key));
+        let known = good_known_peers(&*handle.chitchat().lock().await);
+        let peers_diff = gossip_changes(&last_known, &known);
+        for peer in peers_diff.changed {
+            add_pending(&mut pending, peer);
+        }
+        for peer in &peers_diff.gone {
+            pending.retain(|p| p.public_key != peer.public_key);
+            mesh.remove_peer(peer);
+        }
+        last_known = known;
+
+        // Configure the queue one by one. A failed peer stays for the next update.
+        let mut failed = Vec::new();
+        for peer in pending.drain(..) {
+            if let Err(err) = mesh.add_peer(&peer) {
+                tracing::error!(node_id = %peer.node_id, mesh_ip = %peer.mesh_ip, "cannot configure mesh peer: {err:#}");
+                failed.push(peer);
+            }
+        }
+        pending = failed;
+
+        // The join server must also see the queued peers.
+        peers.send_replace(mesh.peers().iter().chain(&pending).cloned().collect());
+
         tokio::select! {
             changed = watcher.changed() => {
                 if changed.is_err() {
                     return;
                 }
             }
-            // Wakes up the loop on changes to pending peers
-            // from `handle_join` of the join server
-            _ = pending.changed.notified() => {}
+            // No branch when all senders are gone: then only gossip and the timer wake the loop.
+            Some(peer) = new_peers.recv() => add_pending(&mut pending, peer),
             _ = tokio::time::sleep(resync_interval) => {}
         }
     }

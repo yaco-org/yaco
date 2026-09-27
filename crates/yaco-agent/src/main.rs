@@ -1,16 +1,16 @@
 use std::io::IsTerminal;
 use std::net::{IpAddr, SocketAddr};
 use std::path::PathBuf;
-use std::sync::Arc;
 
 use clap::Parser;
 use defguard_wireguard_rs::key::Key;
+use tokio::sync::{mpsc, watch};
 use tracing_subscriber::EnvFilter;
 use yaco_agent::config::Config;
 use yaco_agent::gossip;
 use yaco_agent::join::{self, Bootstrap, JoinServer};
 use yaco_agent::keys::ClusterKeys;
-use yaco_agent::mesh::{self, Mesh, MeshPeer, PendingPeers};
+use yaco_agent::mesh::{self, Mesh, MeshPeer};
 
 #[derive(Parser)]
 #[command(version, about = "YACO node agent")]
@@ -44,34 +44,32 @@ async fn main() -> anyhow::Result<()> {
     let public_key = private_key.public_key().to_string();
     let endpoint = SocketAddr::new(config.node.public_ip, config.node.mesh_port);
     let boot = Bootstrap::create(&config)?;
-    let pending = Arc::new(PendingPeers::new(config.cluster.pending_peer_ttl));
+    // Pending peers to `mesh::sync_peers`, and all peers of this node back to the join server.
+    let (new_peers_tx, new_peers_rx) = mpsc::unbounded_channel();
+    let (peers_tx, peers_rx) = watch::channel(Vec::new());
 
-    let (own_facts, gossip_seeds) = if config.node.seeds.is_empty() {
+    let (own_facts, members, gossip_seeds) = if config.node.seeds.is_empty() {
         tracing::info!("no seeds, starting a new cluster");
         let own_facts = MeshPeer {
+            node_id: config.node.id.clone(),
             public_key,
             mesh_ip: mesh::mesh_ip(config.cluster.mesh_subnet, &config.node.id, 0),
             endpoint,
         };
-        (own_facts, Vec::new())
+        (own_facts, Vec::new(), Vec::new())
     } else {
         let (own_facts, response) =
             join::join(&boot, &keys, &config, &public_key, endpoint).await?;
-        // The members are mesh peers before gossip has them.
-        pending.add(response.members);
         // The gossip seed is the mesh address of the seed.
-        (own_facts, vec![response.gossip_seed])
+        (own_facts, response.members, vec![response.gossip_seed])
     };
 
     let mut mesh = Mesh::create(&config, &private_key, &keys.mesh_psk, own_facts.mesh_ip)?;
 
-    // chitchat sends its first gossip to the seed over the mesh,
-    // so the peers from the join must be configured before it starts.
-    mesh.set_peers(mesh::desired_peers(
-        Vec::new(),
-        pending.current(&[]),
-        &own_facts.public_key,
-    ));
+    // Send all discovered peers from joining a cluster to be configured by `mesh::sync_peers`
+    for peer in members {
+        new_peers_tx.send(peer)?;
+    }
 
     let gossip_addr = SocketAddr::new(IpAddr::V4(own_facts.mesh_ip), config.cluster.gossip_port);
     let chitchat_config =
@@ -82,10 +80,9 @@ async fn main() -> anyhow::Result<()> {
     boot.set_server(&keys)?;
     let join_server = JoinServer {
         config: config.clone(),
-        chitchat: handle.chitchat(),
-        self_id: handle.chitchat_id().clone(),
         own: own_facts.clone(),
-        pending: pending.clone(),
+        new_peers: new_peers_tx,
+        peers: peers_rx,
     };
 
     tracing::info!(
@@ -103,7 +100,7 @@ async fn main() -> anyhow::Result<()> {
         _ = async {
             tokio::join!(
                 gossip::log_membership(&handle),
-                mesh::sync_peers(&handle, &mut mesh, &pending, config.cluster.peer_resync_interval),
+                mesh::sync_peers(&handle, &mut mesh, new_peers_rx, peers_tx, config.cluster.peer_resync_interval),
             )
         } => {
             tracing::error!("chitchat stopped");

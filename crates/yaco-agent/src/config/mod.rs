@@ -96,9 +96,6 @@ pub struct ClusterConfig {
     /// How often the peer list is synchronized without a membership change.
     #[serde(with = "humantime_serde")]
     pub peer_resync_interval: Duration,
-    /// How long a peer from a join stays configured without appearing in gossip.
-    #[serde(with = "humantime_serde")]
-    pub pending_peer_ttl: Duration,
 
     // Gossip.
     /// chitchat ignores messages with another cluster ID.
@@ -151,7 +148,6 @@ impl Default for ClusterConfig {
             mesh_subnet: "10.42.0.0/16".parse().unwrap(),
             mtu: 1420,
             peer_resync_interval: Duration::from_secs(30),
-            pending_peer_ttl: Duration::from_secs(60),
 
             cluster_id: "yaco".to_string(),
             gossip_port: 7280,

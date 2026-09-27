@@ -2,7 +2,7 @@
 
 use std::collections::HashSet;
 
-use chitchat::{Chitchat, ChitchatId, DeletionStatus, VersionedValue};
+use chitchat::{Chitchat, ChitchatId, DeletionStatus, NodeState, VersionedValue};
 use tokio::sync::watch;
 
 use crate::config::ClusterConfig;
@@ -43,6 +43,16 @@ pub fn chitchat_with_nodes(
         chitchat.reset_node_state_if_update(&id, key_values, max_version, 0);
     }
     chitchat
+}
+
+/// The state of node `id` with `key_values`, as gossip would bring it.
+pub fn node_state(id: &ChitchatId, key_values: Vec<(String, String)>) -> NodeState {
+    let chitchat = chitchat_with_nodes(
+        &chitchat_id("observer", 1),
+        Vec::new(),
+        vec![(id.clone(), key_values)],
+    );
+    chitchat.node_state(id).unwrap().clone()
 }
 
 /// Converts `(&str, &str)` pairs to owned key-value pairs.

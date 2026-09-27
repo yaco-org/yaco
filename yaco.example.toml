@@ -27,8 +27,6 @@ mesh_subnet = "10.42.0.0/16"
 mtu = 1420
 # How often the peer list is synchronized without a membership change.
 peer_resync_interval = "30s"
-# How long a peer from a join stays configured without appearing in gossip.
-pending_peer_ttl = "1m"
 
 # chitchat ignores messages with another cluster ID.
 cluster_id = "yaco"

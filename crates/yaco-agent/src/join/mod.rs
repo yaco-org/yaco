@@ -24,17 +24,16 @@ use axum::extract::State;
 use axum::http::StatusCode;
 use axum::routing::post;
 use axum::{Json, Router};
-use chitchat::{Chitchat, ChitchatId};
 use defguard_wireguard_rs::key::Key;
 use defguard_wireguard_rs::net::IpAddrMask;
 use defguard_wireguard_rs::peer::Peer;
 use defguard_wireguard_rs::{InterfaceConfiguration, Kernel, WGApi, WireguardInterfaceApi};
 use serde::{Deserialize, Serialize};
-use tokio::sync::Mutex;
+use tokio::sync::{mpsc, watch};
 
 use crate::config::{ClusterConfig, Config, ConfigFingerprint};
 use crate::keys::ClusterKeys;
-use crate::mesh::{self, MeshPeer, PendingPeers};
+use crate::mesh::{self, MeshPeer};
 
 /// Addresses inside the bootstrap tunnel. They are not configurable.
 /// They are link-local, so they are never routed,
@@ -47,17 +46,17 @@ pub const BOOT_PREFIX_LEN: u8 = 30;
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct JoinRequest {
-    pub node_id: String,
     /// `[cluster]` config fingerprint of the joining node.
     /// The seed refuses the join if it differs from its own.
     pub config_fingerprint: ConfigFingerprint,
-    /// The main WireGuard key, the proposed mesh IP and the public endpoint.
+    /// The node ID, the main WireGuard key, the proposed mesh IP and the public endpoint.
     pub peer: MeshPeer,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct JoinResponse {
-    /// The seed and all nodes that the seed knows, live or dead.
+    /// The seed and all its peers: the nodes that it knows, live or dead,
+    /// and the nodes that joined but are not in gossip yet.
     pub members: Vec<MeshPeer>,
     /// Gossip address of the seed, inside the mesh.
     pub gossip_seed: SocketAddr,
@@ -83,7 +82,7 @@ pub fn check_join(
     if request.config_fingerprint != cluster.fingerprint() {
         return Err(JoinRefusal::ConfigMismatch);
     }
-    if request.node_id.is_empty() {
+    if request.peer.node_id.is_empty() {
         return Err(JoinRefusal::BadRequest("empty node_id".to_string()));
     }
     mesh::check_public_key(&request.peer.public_key)
@@ -163,11 +162,12 @@ impl Bootstrap {
 /// Shared state of the join endpoint.
 pub struct JoinServer {
     pub config: Config,
-    pub chitchat: Arc<Mutex<Chitchat>>,
-    pub self_id: ChitchatId,
     /// Facts of this node.
     pub own: MeshPeer,
-    pub pending: Arc<PendingPeers>,
+    /// Sends the peer of every accepted node to `mesh::sync_peers`.
+    pub new_peers: mpsc::UnboundedSender<MeshPeer>,
+    /// All peers of this node, from `mesh::sync_peers`.
+    pub peers: watch::Receiver<Vec<MeshPeer>>,
 }
 
 /// Serves `POST /join` on the bootstrap interface only.
@@ -198,31 +198,36 @@ async fn handle_join(
     State(server): State<Arc<JoinServer>>,
     Json(request): Json<JoinRequest>,
 ) -> Result<Json<JoinResponse>, (StatusCode, String)> {
-    let (gossip_seed, nodes) = {
-        let chitchat = server.chitchat.lock().await;
-        let nodes = chitchat.node_states().clone();
-        let addr = chitchat.self_chitchat_id().gossip_advertise_addr;
-        (addr, nodes)
-    };
+    let node_id = &request.peer.node_id;
+    let gossip_seed = SocketAddr::new(
+        IpAddr::V4(server.own.mesh_ip),
+        server.config.cluster.gossip_port,
+    );
 
-    // All nodes that chitchat knows, dead ones included:
-    // a dead node can come back and still have its mesh IP.
-    let mut known = mesh::known_peers(&nodes);
-    known.remove(&*server.self_id.node_id);
+    // The peers include dead nodes, because a dead node can come back and still have its mesh IP,
+    // and the nodes that joined but are not in gossip yet.
     // An earlier generation of the joining node gives its mesh IP free.
-    known.remove(&request.node_id);
     let mut members = vec![server.own.clone()];
-    members.extend(known.into_values());
+    members.extend(
+        server
+            .peers
+            .borrow()
+            .iter()
+            .filter(|peer| peer.node_id != *node_id)
+            .cloned(),
+    );
 
-    // Mesh IPs in use: the members and the nodes that joined but are not in gossip yet.
-    let mut taken = members.clone();
-    taken.extend(server.pending.current(&members));
-
-    match check_join(&request, &server.config.cluster, &taken) {
+    match check_join(&request, &server.config.cluster, &members) {
         Ok(()) => {
-            tracing::info!(node_id = %request.node_id, mesh_ip = %request.peer.mesh_ip, endpoint = %request.peer.endpoint, "accepted join");
+            tracing::info!(%node_id, mesh_ip = %request.peer.mesh_ip, endpoint = %request.peer.endpoint, "accepted join");
             // Add the new node as a mesh peer now, not after gossip.
-            server.pending.add(vec![request.peer]);
+            if server.new_peers.send(request.peer.clone()).is_err() {
+                tracing::error!(%node_id, "cannot add the mesh peer: peer sync stopped");
+                return Err((
+                    StatusCode::SERVICE_UNAVAILABLE,
+                    "peer sync stopped".to_string(),
+                ));
+            }
             Ok(Json(JoinResponse {
                 members,
                 gossip_seed,
@@ -234,15 +239,15 @@ async fn handle_join(
                 server.config.cluster.fingerprint(),
                 request.config_fingerprint
             );
-            tracing::warn!(node_id = %request.node_id, "refused join: {reason}");
+            tracing::warn!(%node_id, "refused join: {reason}");
             Err((StatusCode::BAD_REQUEST, reason))
         }
         Err(JoinRefusal::BadRequest(reason)) => {
-            tracing::warn!(node_id = %request.node_id, "refused join: {reason}");
+            tracing::warn!(%node_id, "refused join: {reason}");
             Err((StatusCode::BAD_REQUEST, reason))
         }
         Err(JoinRefusal::MeshIpInUse) => {
-            tracing::info!(node_id = %request.node_id, mesh_ip = %request.peer.mesh_ip, "refused join: mesh IP in use");
+            tracing::info!(%node_id, mesh_ip = %request.peer.mesh_ip, "refused join: mesh IP in use");
             Err((StatusCode::CONFLICT, "mesh IP in use".to_string()))
         }
     }
@@ -279,12 +284,12 @@ pub async fn join(
             let mut attempt = 0;
             while attempt < cluster.max_mesh_ip_attempts {
                 let peer = MeshPeer {
+                    node_id: node_id.clone(),
                     public_key: public_key.to_string(),
                     mesh_ip: mesh::mesh_ip(cluster.mesh_subnet, node_id, attempt),
                     endpoint,
                 };
                 let request = JoinRequest {
-                    node_id: node_id.clone(),
                     config_fingerprint: config_fingerprint.clone(),
                     peer: peer.clone(),
                 };
