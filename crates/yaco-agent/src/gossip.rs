@@ -88,23 +88,6 @@ pub async fn live_node_ids(handle: &ChitchatHandle) -> Vec<String> {
         .collect()
 }
 
-/// Logs the live node set every time it changes.
-/// Returns when chitchat stops.
-pub async fn log_membership(handle: &ChitchatHandle) {
-    let mut watcher = handle.chitchat().lock().await.live_nodes_watcher();
-    loop {
-        let ids: Vec<String> = watcher
-            .borrow_and_update()
-            .keys()
-            .map(|id| id.node_id.to_string())
-            .collect();
-        tracing::info!(live = ?ids, "membership changed");
-        if watcher.changed().await.is_err() {
-            return;
-        }
-    }
-}
-
 /// chitchat uses the generation ID to detect a restarted node.
 /// It must increase on every start,
 /// so use the start time, as chitchat recommends.

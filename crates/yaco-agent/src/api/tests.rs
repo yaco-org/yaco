@@ -2,22 +2,109 @@
 
 use super::*;
 
+use std::collections::BTreeMap;
+
+use yaco_api::Liveness;
+
+/// A running API server on 127.0.0.1 with `view`.
+/// Returns its base URL and the senders that the view task has in the agent.
+async fn start(
+    view: ClusterView,
+    event_buffer: usize,
+) -> (String, watch::Sender<ClusterView>, broadcast::Sender<Event>) {
+    let (view_tx, view_rx) = watch::channel(view);
+    let (events_tx, _) = broadcast::channel(event_buffer);
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let base = format!("http://{}", listener.local_addr().unwrap());
+    let state = ApiState {
+        view: view_rx,
+        events: events_tx.clone(),
+    };
+    tokio::spawn(serve(listener, state));
+    (base, view_tx, events_tx)
+}
+
+fn client() -> reqwest::Client {
+    reqwest::Client::builder().no_proxy().build().unwrap()
+}
+
+fn node(id: &str, liveness: Liveness) -> Node {
+    Node {
+        id: id.to_string(),
+        generation: 1,
+        liveness,
+        facts: BTreeMap::new(),
+    }
+}
+
+/// The view of n1, which knows n2.
+fn two_nodes() -> ClusterView {
+    let mut view = ClusterView::empty("n1");
+    for node in [node("n1", Liveness::Live), node("n2", Liveness::Dead)] {
+        view.nodes.insert(node.id.clone(), node);
+    }
+    view
+}
+
+/// Reads server-sent events from a response, one at a time.
+struct EventReader {
+    response: reqwest::Response,
+    buffer: String,
+}
+
+impl EventReader {
+    async fn next(&mut self) -> Event {
+        loop {
+            // An event ends with an empty line. Keep-alive comments start with ':'.
+            if let Some(end) = self.buffer.find("\n\n") {
+                let block: String = self.buffer.drain(..end + 2).collect();
+                let data: String = block
+                    .lines()
+                    .filter_map(|line| line.strip_prefix("data: "))
+                    .collect();
+                if !data.is_empty() {
+                    return serde_json::from_str(&data).unwrap();
+                }
+                continue;
+            }
+            let chunk = self.response.chunk().await.unwrap().expect("stream ended");
+            self.buffer.push_str(std::str::from_utf8(&chunk).unwrap());
+        }
+    }
+}
+
+async fn read_events(base: &str) -> EventReader {
+    let response = client()
+        .get(format!("{base}{EVENTS_PATH}"))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    assert_eq!(response.headers()["content-type"], "text/event-stream");
+    EventReader {
+        response,
+        buffer: String::new(),
+    }
+}
+
 fn spec_json() -> serde_json::Value {
     serde_json::from_str(&spec().to_json().unwrap()).unwrap()
 }
 
 #[test]
-fn spec_has_every_container_operation() {
+fn spec_has_every_operation() {
     let spec = spec();
     let paths = &spec.paths.paths;
 
+    assert!(paths[NODES_PATH].get.is_some());
+    assert!(paths[EVENTS_PATH].get.is_some());
     assert!(paths[CONTAINERS_PATH].get.is_some());
     let one = &paths[CONTAINER_PATH];
     assert!(one.put.is_some());
     assert!(one.get.is_some());
     assert!(one.delete.is_some());
 
-    assert_eq!(paths.len(), 2, "unexpected paths: {:?}", paths.keys());
+    assert_eq!(paths.len(), 4, "unexpected paths: {:?}", paths.keys());
 }
 
 #[test]
@@ -42,15 +129,62 @@ fn spec_has_the_schemas_of_the_bodies() {
     let schemas = spec["components"]["schemas"].as_object().unwrap();
     assert!(schemas.contains_key("ContainerManifest"));
     assert!(schemas.contains_key("ErrorResponse"));
+    assert!(schemas.contains_key("Node"));
+    assert!(schemas.contains_key("Event"));
 }
 
 #[tokio::test]
-async fn every_operation_answers_not_implemented() {
-    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
-    let base = format!("http://{}", listener.local_addr().unwrap());
-    tokio::spawn(serve(listener));
+async fn nodes_are_the_nodes_of_the_view() {
+    let (base, _view, _events) = start(two_nodes(), 16).await;
+    let response = client()
+        .get(format!("{base}{NODES_PATH}"))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    let nodes: Vec<Node> = response.json().await.unwrap();
+    assert_eq!(nodes, two_nodes().nodes.into_values().collect::<Vec<_>>());
+}
 
-    let client = reqwest::Client::builder().no_proxy().build().unwrap();
+#[tokio::test]
+async fn event_stream_starts_with_a_snapshot_then_sends_every_event() {
+    let (base, _view, events) = start(two_nodes(), 16).await;
+    let mut reader = read_events(&base).await;
+
+    assert_eq!(reader.next().await, view::snapshot(&two_nodes()));
+
+    let event = Event::NodeChanged {
+        node: node("n2", Liveness::Live),
+    };
+    events.send(event.clone()).unwrap();
+    assert_eq!(reader.next().await, event);
+}
+
+#[tokio::test]
+async fn slow_stream_gets_a_new_snapshot_instead_of_the_missed_events() {
+    // The channel keeps only one event, so a reader that misses more lags.
+    let (base, view, events) = start(two_nodes(), 1).await;
+    let mut reader = read_events(&base).await;
+    reader.next().await;
+
+    // Send a bunch of "missed" events about removing some nodes
+    for id in ["n2", "n3", "n4"] {
+        events
+            .send(Event::NodeRemoved { id: id.to_string() })
+            .unwrap();
+    }
+    // Force change the view to something testable.
+    let mut changed = two_nodes();
+    changed.nodes.remove("n2");
+    view.send_replace(changed.clone());
+
+    assert_eq!(reader.next().await, view::snapshot(&changed));
+}
+
+#[tokio::test]
+async fn container_operation_answers_not_implemented() {
+    let (base, _view, _events) = start(two_nodes(), 16).await;
+    let client = client();
     let one = format!("{base}{}", CONTAINER_PATH.replace("{name}", "web"));
     let requests = [
         client.get(format!("{base}{CONTAINERS_PATH}")),

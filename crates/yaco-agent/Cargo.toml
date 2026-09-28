@@ -16,6 +16,7 @@ axum.workspace = true
 chitchat.workspace = true
 clap.workspace = true
 defguard_wireguard_rs.workspace = true
+futures-util.workspace = true
 hkdf.workspace = true
 humantime-serde.workspace = true
 ipnet.workspace = true

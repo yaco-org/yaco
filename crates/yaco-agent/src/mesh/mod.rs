@@ -25,14 +25,12 @@
 
 mod tests;
 
-use std::collections::BTreeMap;
 use std::fmt;
 use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 use std::str::FromStr;
 use std::time::Duration;
 
 use anyhow::Context;
-use chitchat::{Chitchat, ChitchatHandle, ChitchatId, NodeState};
 use defguard_wireguard_rs::key::Key;
 use defguard_wireguard_rs::net::IpAddrMask;
 use defguard_wireguard_rs::peer::Peer;
@@ -42,13 +40,16 @@ use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use tokio::sync::{mpsc, watch};
 
-use crate::config::Config;
-use crate::gossip::LEAVING_KEY;
+use yaco_api::{Liveness, Node};
 
-/// Fact keys in the own chitchat namespace.
-pub const WG_PUBLIC_KEY_KEY: &str = "facts/wg_public_key";
-pub const MESH_IP_KEY: &str = "facts/mesh_ip";
-pub const ENDPOINT_KEY: &str = "facts/endpoint";
+use crate::config::Config;
+use crate::view::{ClusterView, FACTS_PREFIX};
+
+/// Names of the facts that the mesh needs.
+/// In chitchat, the keys have the prefix `view::FACTS_PREFIX`.
+pub const WG_PUBLIC_KEY_FACT: &str = "wg_public_key";
+pub const MESH_IP_FACT: &str = "mesh_ip";
+pub const ENDPOINT_FACT: &str = "endpoint";
 
 /// One node of the mesh, as the WireGuard peer list needs it.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -63,8 +64,8 @@ pub struct MeshPeer {
 
 impl MeshPeer {
     /// The facts of this node, with the mesh IP of `attempt` (see `MeshSubnet::mesh_ip`).
-    pub fn own(config: &Config, public_key: &Key, attempt: u32) -> MeshPeer {
-        MeshPeer {
+    pub fn own(config: &Config, public_key: &Key, attempt: u32) -> Self {
+        Self {
             node_id: config.node.id.clone(),
             public_key: public_key.clone(),
             mesh_ip: config.cluster.mesh_subnet.mesh_ip(&config.node.id, attempt),
@@ -72,26 +73,25 @@ impl MeshPeer {
         }
     }
 
-    /// Parses the facts of one node from its chitchat state.
+    /// Parses the facts of one node of the cluster view.
     /// Received data can be malformed, so this never panics.
-    pub fn from_node_state(state: &NodeState) -> anyhow::Result<MeshPeer> {
-        let public_key = state
-            .get(WG_PUBLIC_KEY_KEY)
-            .context("missing wg_public_key")?;
-        let public_key =
-            Key::try_from(public_key).map_err(|err| anyhow::anyhow!("bad wg_public_key: {err}"))?;
-        let mesh_ip = state
-            .get(MESH_IP_KEY)
-            .context("missing mesh_ip")?
+    pub fn from_node(node: &Node) -> anyhow::Result<Self> {
+        let fact = |name: &str| {
+            node.facts
+                .get(name)
+                .with_context(|| format!("missing {name}"))
+        };
+        let public_key = fact(WG_PUBLIC_KEY_FACT)?;
+        let public_key = Key::try_from(public_key.as_str())
+            .map_err(|err| anyhow::anyhow!("bad {WG_PUBLIC_KEY_FACT}: {err}"))?;
+        let mesh_ip = fact(MESH_IP_FACT)?
             .parse()
-            .context("bad mesh_ip")?;
-        let endpoint = state
-            .get(ENDPOINT_KEY)
-            .context("missing endpoint")?
+            .with_context(|| format!("bad {MESH_IP_FACT}"))?;
+        let endpoint = fact(ENDPOINT_FACT)?
             .parse()
-            .context("bad endpoint")?;
-        Ok(MeshPeer {
-            node_id: state.chitchat_id().node_id.to_string(),
+            .with_context(|| format!("bad {ENDPOINT_FACT}"))?;
+        Ok(Self {
+            node_id: node.id.clone(),
             public_key,
             mesh_ip,
             endpoint,
@@ -101,11 +101,14 @@ impl MeshPeer {
     /// Returns the facts to publish for this node.
     /// The node ID is not a fact: chitchat has it in the node's `ChitchatId`.
     pub fn to_facts(&self) -> Vec<(String, String)> {
-        vec![
-            (WG_PUBLIC_KEY_KEY.to_string(), self.public_key.to_string()),
-            (MESH_IP_KEY.to_string(), self.mesh_ip.to_string()),
-            (ENDPOINT_KEY.to_string(), self.endpoint.to_string()),
+        [
+            (WG_PUBLIC_KEY_FACT, self.public_key.to_string()),
+            (MESH_IP_FACT, self.mesh_ip.to_string()),
+            (ENDPOINT_FACT, self.endpoint.to_string()),
         ]
+        .into_iter()
+        .map(|(name, value)| (format!("{FACTS_PREFIX}{name}"), value))
+        .collect()
     }
 }
 
@@ -121,7 +124,7 @@ pub struct MeshSubnet(Ipv4Net);
 impl TryFrom<Ipv4Net> for MeshSubnet {
     type Error = anyhow::Error;
 
-    fn try_from(net: Ipv4Net) -> anyhow::Result<MeshSubnet> {
+    fn try_from(net: Ipv4Net) -> anyhow::Result<Self> {
         // A /31 or /32 has no room for host addresses.
         anyhow::ensure!(
             net.prefix_len() <= 30,
@@ -132,12 +135,12 @@ impl TryFrom<Ipv4Net> for MeshSubnet {
             "mesh subnet {net} has host bits set, write {}",
             net.trunc()
         );
-        Ok(MeshSubnet(net))
+        Ok(Self(net))
     }
 }
 
 impl From<MeshSubnet> for Ipv4Net {
-    fn from(subnet: MeshSubnet) -> Ipv4Net {
+    fn from(subnet: MeshSubnet) -> Self {
         subnet.0
     }
 }
@@ -145,9 +148,9 @@ impl From<MeshSubnet> for Ipv4Net {
 impl FromStr for MeshSubnet {
     type Err = anyhow::Error;
 
-    fn from_str(text: &str) -> anyhow::Result<MeshSubnet> {
+    fn from_str(text: &str) -> anyhow::Result<Self> {
         let net: Ipv4Net = text.parse()?;
-        MeshSubnet::try_from(net)
+        Self::try_from(net)
     }
 }
 
@@ -184,42 +187,18 @@ impl MeshSubnet {
     }
 }
 
-/// Keeps only the latest generation of every node ID.
-/// A restarted node has a new generation (and a new key),
-/// and chitchat keeps the old generation as a dead node for a while.
-fn latest_generations<'a, T>(
-    nodes: impl IntoIterator<Item = (&'a ChitchatId, T)>,
-) -> BTreeMap<String, T> {
-    let mut latest: BTreeMap<String, (u64, T)> = BTreeMap::new();
-    for (id, value) in nodes {
-        let is_newer = match latest.get(&*id.node_id) {
-            Some((generation, _)) => id.generation_id > *generation,
-            None => true,
-        };
-        if is_newer {
-            latest.insert(id.node_id.to_string(), (id.generation_id, value));
-        }
-    }
-    latest
-        .into_iter()
-        .map(|(node_id, (_, value))| (node_id, value))
-        .collect()
-}
-
-/// Returns the peers of all other nodes that chitchat knows, live or dead.
-/// Takes the latest generation of every node, skips the own node and nodes that left gracefully,
+/// Returns the peers of all other nodes of the view, live or dead.
+/// Skips the nodes that left gracefully,
 /// and skips (with a warning) nodes with bad or missing facts.
-fn good_known_peers(chitchat: &Chitchat) -> Vec<MeshPeer> {
-    let own_node_id = &chitchat.self_chitchat_id().node_id;
+fn good_known_peers(view: &ClusterView) -> Vec<MeshPeer> {
     let mut peers = Vec::new();
-    for (node_id, state) in latest_generations(chitchat.node_states()) {
-        // Also skips older generations of this node.
-        if *node_id == **own_node_id || state.get(LEAVING_KEY).is_some() {
+    for node in view.nodes.values() {
+        if node.id == view.self_id || node.liveness == Liveness::Leaving {
             continue;
         }
-        match MeshPeer::from_node_state(state) {
+        match MeshPeer::from_node(node) {
             Ok(peer) => peers.push(peer),
-            Err(err) => tracing::warn!(%node_id, "skipping node with bad facts: {err:#}"),
+            Err(err) => tracing::warn!(node_id = %node.id, "skipping node with bad facts: {err:#}"),
         }
     }
     peers
@@ -242,7 +221,7 @@ struct PeersDiff {
 /// Returns the peers that are new or changed in `new`,
 /// and the peers of `old` whose node is not in `new`:
 /// the node left gracefully, or chitchat forgot it.
-fn gossip_changes(old: &[MeshPeer], new: &[MeshPeer]) -> PeersDiff {
+fn get_gossip_changes(old: &[MeshPeer], new: &[MeshPeer]) -> PeersDiff {
     let changed = new
         .iter()
         .filter(|peer| !old.contains(peer))
@@ -373,20 +352,19 @@ impl Mesh {
     }
 }
 
-/// Configures the peers from gossip and from the channel `new_peers`,
-/// and removes the peers of nodes that disappear from gossip.
+/// Configures the peers from the cluster view and from the channel `new_peers`,
+/// and removes the peers of nodes that disappear from the view.
 ///
 /// `new_peers` brings the peers that are not in gossip yet:
 /// from `main` after a join, and from the join server for every accepted node.
 /// After every update, `peers` gets all peers of this node, queued ones included,
 /// for the mesh IP check and the response of the join server.
 ///
-/// Updates on every change of the live set, on every new peer from the channel,
-/// and also every `resync_interval`: to retry failed peers,
-/// and to remove dead nodes that chitchat forgot.
-/// Returns when chitchat stops.
+/// Updates on every change of the view, on every new peer from the channel,
+/// and also every `resync_interval`, to retry failed peers.
+/// Returns when the view task stops.
 pub async fn sync_peers(
-    handle: &ChitchatHandle,
+    mut view: watch::Receiver<ClusterView>,
     mesh: &mut Mesh,
     mut new_peers: mpsc::UnboundedReceiver<MeshPeer>,
     peers: watch::Sender<Vec<MeshPeer>>,
@@ -396,12 +374,9 @@ pub async fn sync_peers(
     let mut pending: Vec<MeshPeer> = Vec::new();
     // The gossip view of the last update.
     let mut last_known: Vec<MeshPeer> = Vec::new();
-    let mut watcher = handle.chitchat().lock().await.live_nodes_watcher();
     loop {
-        // The live set is only the trigger. Mark it as seen.
-        watcher.borrow_and_update();
-        let known = good_known_peers(&*handle.chitchat().lock().await);
-        let peers_diff = gossip_changes(&last_known, &known);
+        let known = good_known_peers(&view.borrow_and_update());
+        let peers_diff = get_gossip_changes(&last_known, &known);
         for peer in peers_diff.changed {
             add_pending(&mut pending, peer);
         }
@@ -425,7 +400,7 @@ pub async fn sync_peers(
         peers.send_replace(mesh.peers().iter().chain(&pending).cloned().collect());
 
         tokio::select! {
-            changed = watcher.changed() => {
+            changed = view.changed() => {
                 if changed.is_err() {
                     return;
                 }

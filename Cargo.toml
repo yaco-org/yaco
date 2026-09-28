@@ -45,6 +45,8 @@ axum = "0.8"
 reqwest = { version = "0.13", default-features = false, features = ["json"] }
 utoipa = "6.0"
 utoipa-axum = "0.3"
+# Streams for server-sent events
+futures-util = { version = "0.3", default-features = false }
 
 # Crates of this workspace
 yaco-api = { path = "crates/yaco-api" }

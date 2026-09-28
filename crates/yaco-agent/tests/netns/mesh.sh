@@ -5,14 +5,15 @@
 # - every node reaches every other node over the mesh,
 # - gossip listens on the mesh IP only,
 # - a node cut off for a while comes back without a restart,
-# - a graceful leave removes the peer,
+# - the node API lists the nodes and streams events,
+# - a graceful leave removes the peer and shows the node as leaving in the API,
 # - a node with a wrong join token cannot join (n4),
 # - a node with another [cluster] config cannot join (n5).
 #
 # The script runs itself in a new user namespace,
 # where it has CAP_NET_ADMIN over the namespaces that it creates.
 #
-# Needs: unshare (util-linux), ip and ss (iproute2), ping,
+# Needs: unshare (util-linux), ip and ss (iproute2), ping, curl,
 # and the WireGuard kernel module (Linux 5.6 or later has it).
 #
 # Environment:
@@ -34,6 +35,7 @@ WRONG_TOKEN="netns-test-token-wrong-9876"
 # The script writes these values into the config files and checks them later,
 # so the test does not depend on the defaults of the agent.
 GOSSIP_PORT=7280
+API_PORT=7284
 BOOT_PORT=7282
 MESH_INTERFACE=yaco-test-mesh
 
@@ -86,6 +88,7 @@ mesh_interface = "$MESH_INTERFACE"
 
 [cluster]
 gossip_port = $GOSSIP_PORT
+api_port = $API_PORT
 $3
 EOF
 }
@@ -167,6 +170,28 @@ for n in $NODES; do
 done
 echo "ok: gossip listens on the mesh IP only"
 
+# Prints the answer of the node API of node $1 to GET $2.
+api_get() {
+  ip netns exec "$1" curl -sf --noproxy '*' "http://$(mesh_ip "$1"):$API_PORT$2"
+}
+
+# The node API of n1 lists all nodes, and its event stream starts with a snapshot.
+wait_for_live_set n1 '["n1", "n2", "n3"]' 30
+nodes=$(api_get n1 /v1/nodes) || fail "the node API of n1 does not answer"
+for n in $NODES; do
+  case "$nodes" in
+  *"\"id\":\"n$n\""*) ;;
+  *) fail "the node API of n1 does not list n$n: $nodes" ;;
+  esac
+done
+echo "ok: the node API lists all nodes"
+# The stream never ends, so curl stops after one second.
+events=$(ip netns exec n1 curl -sN --noproxy '*' --max-time 1 "http://$(mesh_ip n1):$API_PORT/v1/events" || true)
+case "$events" in
+"data: {\"type\":\"snapshot\""*) echo "ok: the event stream starts with a snapshot" ;;
+*) fail "unexpected start of the event stream: $events" ;;
+esac
+
 # Cut n2 off until every node sees the split.
 # The nodes must keep the peers of dead nodes,
 # so that n2 comes back when the link is up again.
@@ -198,6 +223,9 @@ for n in 1 2; do
   done
   echo "ok: n$n removed the peer of n3"
 done
+api_get n1 /v1/nodes | grep -q '"id":"n3","generation":[0-9]*,"liveness":"leaving"' ||
+  fail "the node API of n1 does not show n3 as leaving"
+echo "ok: the node API shows n3 as leaving"
 
 # The node with the wrong token must fail to join and exit.
 deadline=$(($(date +%s) + 60))

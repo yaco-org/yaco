@@ -89,7 +89,15 @@ unshare --user --map-root-user --net sh
 ## Node API
 
 Every node serves the node API on its mesh IP (`cluster.api_port`, TCP 7284).
-For now every operation answers 501 Not Implemented.
+`GET /v1/nodes` lists the nodes of the cluster, and `GET /v1/events` streams their changes as server-sent events.
+For example, on a node:
+
+```sh
+curl http://<mesh IP>:7284/v1/nodes
+curl -N http://<mesh IP>:7284/v1/events
+```
+
+The container operations answer 501 Not Implemented for now.
 
 The handlers are in `crates/yaco-agent/src/api`, and the paths and types are in the `yaco-api` crate,
 which clients can use too.

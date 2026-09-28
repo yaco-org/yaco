@@ -6,14 +6,15 @@ use anyhow::Context;
 use clap::Parser;
 use defguard_wireguard_rs::key::Key;
 use tokio::net::TcpListener;
-use tokio::sync::{mpsc, watch};
+use tokio::sync::{broadcast, mpsc, watch};
 use tracing_subscriber::EnvFilter;
-use yaco_agent::api;
+use yaco_agent::api::{self, ApiState};
 use yaco_agent::config::Config;
 use yaco_agent::gossip;
 use yaco_agent::join::{self, Bootstrap, JoinServer};
 use yaco_agent::keys::ClusterKeys;
 use yaco_agent::mesh::{self, Mesh, MeshPeer};
+use yaco_agent::view::{self, ClusterView};
 
 #[derive(Parser)]
 #[command(version, about = "YACO node agent")]
@@ -49,6 +50,9 @@ async fn main() -> anyhow::Result<()> {
     // Pending peers to `mesh::sync_peers`, and all peers of this node back to the join server.
     let (new_peers_tx, new_peers_rx) = mpsc::unbounded_channel();
     let (peers_tx, peers_rx) = watch::channel(Vec::new());
+    // The cluster view (`view::run`) to its readers: the latest view, and every change.
+    let (view_tx, view_rx) = watch::channel(ClusterView::empty(&config.node.id));
+    let (events_tx, _) = broadcast::channel(view::EVENT_BUFFER);
 
     let (own_facts, members, gossip_seeds) = if config.node.seeds.is_empty() {
         tracing::info!("no seeds, starting a new cluster");
@@ -105,8 +109,9 @@ async fn main() -> anyhow::Result<()> {
     let result = tokio::select! {
         _ = async {
             tokio::join!(
-                gossip::log_membership(&handle),
-                mesh::sync_peers(&handle, &mut mesh, new_peers_rx, peers_tx, config.cluster.peer_resync_interval),
+                view::run(&handle, view_tx, events_tx.clone(), config.cluster.peer_resync_interval),
+                view::log_membership(view_rx.clone()),
+                mesh::sync_peers(view_rx.clone(), &mut mesh, new_peers_rx, peers_tx, config.cluster.peer_resync_interval),
             )
         } => {
             tracing::error!("chitchat stopped");
@@ -116,7 +121,7 @@ async fn main() -> anyhow::Result<()> {
             tracing::error!("join endpoint stopped: {result:?}");
             handle.shutdown().await
         }
-        result = api::serve(api_listener) => {
+        result = api::serve(api_listener, ApiState { view: view_rx.clone(), events: events_tx.clone() }) => {
             tracing::error!("node API stopped: {result:?}");
             handle.shutdown().await
         }

@@ -2,6 +2,8 @@
 
 use super::*;
 
+use std::collections::BTreeMap;
+
 // Base64 of 32 bytes of 0x11, of 0x22 and of 0x55,
 // so the keys are easy to tell apart at a glance.
 const KEY_NODE_1: &str = "ERERERERERERERERERERERERERERERERERERERERERE=";
@@ -113,33 +115,55 @@ fn own_facts_come_from_the_config() {
     assert_eq!(own.endpoint, "192.0.2.1:9001".parse().unwrap());
 }
 
-mod from_node_state {
+/// A node of the cluster view with the facts of `peer`.
+fn node(peer: &MeshPeer, liveness: Liveness) -> Node {
+    let facts = peer
+        .to_facts()
+        .into_iter()
+        .map(|(key, value)| (key.strip_prefix(FACTS_PREFIX).unwrap().to_string(), value))
+        .collect();
+    Node {
+        id: peer.node_id.clone(),
+        generation: 1,
+        liveness,
+        facts,
+    }
+}
+
+mod from_node {
     use super::*;
-    use crate::test_util::{chitchat_id, key_values, node_state};
 
     #[test]
     fn facts_round_trip() {
         let original = peer("node-1", KEY_NODE_1, [10, 42, 0, 1]);
-        let state = node_state(&chitchat_id("node-1", 1), original.to_facts());
-        assert_eq!(MeshPeer::from_node_state(&state).unwrap(), original);
+        let node = node(&original, Liveness::Live);
+        assert_eq!(MeshPeer::from_node(&node).unwrap(), original);
     }
 
     #[test]
     fn bad_facts_are_errors() {
         let parse = |pairs: &[(&str, &str)]| {
-            let state = node_state(&chitchat_id("node-1", 1), key_values(pairs));
-            MeshPeer::from_node_state(&state)
+            let node = Node {
+                id: "node-1".to_string(),
+                generation: 1,
+                liveness: Liveness::Live,
+                facts: pairs
+                    .iter()
+                    .map(|(name, value)| (name.to_string(), value.to_string()))
+                    .collect(),
+            };
+            MeshPeer::from_node(&node)
         };
-        let key = (WG_PUBLIC_KEY_KEY, KEY_NODE_1);
-        let ip = (MESH_IP_KEY, "10.42.0.1");
-        let endpoint = (ENDPOINT_KEY, "192.0.2.1:7281");
+        let key = (WG_PUBLIC_KEY_FACT, KEY_NODE_1);
+        let ip = (MESH_IP_FACT, "10.42.0.1");
+        let endpoint = (ENDPOINT_FACT, "192.0.2.1:7281");
         assert!(parse(&[key, ip, endpoint]).is_ok());
 
         assert!(parse(&[ip, endpoint]).is_err());
-        assert!(parse(&[(WG_PUBLIC_KEY_KEY, "not a key"), ip, endpoint]).is_err());
-        assert!(parse(&[key, (MESH_IP_KEY, "10.42.0"), endpoint]).is_err());
+        assert!(parse(&[(WG_PUBLIC_KEY_FACT, "not a key"), ip, endpoint]).is_err());
+        assert!(parse(&[key, (MESH_IP_FACT, "10.42.0"), endpoint]).is_err());
         assert!(parse(&[key, ip]).is_err());
-        assert!(parse(&[key, ip, (ENDPOINT_KEY, "192.0.2.1")]).is_err());
+        assert!(parse(&[key, ip, (ENDPOINT_FACT, "192.0.2.1")]).is_err());
     }
 }
 
@@ -163,7 +187,7 @@ mod gossip_changes {
     #[test]
     fn equal_views_have_no_changes() {
         let view = vec![peer("node-1", KEY_NODE_1, [10, 42, 0, 1])];
-        assert_eq!(gossip_changes(&view, &view), PeersDiff::default());
+        assert_eq!(get_gossip_changes(&view, &view), PeersDiff::default());
     }
 
     #[test]
@@ -174,7 +198,7 @@ mod gossip_changes {
             peer("node-2", KEY_NODE_2, [10, 42, 0, 2]),
         ];
         assert_eq!(
-            gossip_changes(&old, &new),
+            get_gossip_changes(&old, &new),
             PeersDiff {
                 changed: vec![peer("node-2", KEY_NODE_2, [10, 42, 0, 2])],
                 gone: Vec::new(),
@@ -187,7 +211,7 @@ mod gossip_changes {
         let old = vec![peer("node-1", KEY_NODE_1, [10, 42, 0, 1])];
         let new = vec![peer("node-1", KEY_NODE_1_RESTARTED, [10, 42, 0, 1])];
         assert_eq!(
-            gossip_changes(&old, &new),
+            get_gossip_changes(&old, &new),
             PeersDiff {
                 changed: new.clone(),
                 gone: Vec::new()
@@ -203,7 +227,7 @@ mod gossip_changes {
         ];
         let new = vec![peer("node-1", KEY_NODE_1, [10, 42, 0, 1])];
         assert_eq!(
-            gossip_changes(&old, &new),
+            get_gossip_changes(&old, &new),
             PeersDiff {
                 changed: Vec::new(),
                 gone: vec![peer("node-2", KEY_NODE_2, [10, 42, 0, 2])],
@@ -212,128 +236,51 @@ mod gossip_changes {
     }
 }
 
-fn chitchat_id(node_id: &str, generation: u64) -> ChitchatId {
-    ChitchatId::new(node_id, generation, "10.42.0.1:7280".parse().unwrap())
-}
-
-#[test]
-fn latest_generations_keeps_the_newest_generation_of_each_node() {
-    let old = chitchat_id("node-1", 100);
-    let new = chitchat_id("node-1", 200);
-    let other = chitchat_id("node-2", 50);
-    // The order of the input does not matter.
-    let latest = latest_generations([(&new, "new"), (&other, "other"), (&old, "old")]);
-    assert_eq!(latest.len(), 2);
-    assert_eq!(latest["node-1"], "new");
-    assert_eq!(latest["node-2"], "other");
-}
-
-mod known_peers {
+mod good_known_peers {
     use super::*;
-    use crate::test_util::{chitchat_id, chitchat_with_nodes, key_values};
 
-    /// The facts do not have the node ID, so it does not matter here.
-    fn facts(public_key: &str, mesh_ip: [u8; 4]) -> Vec<(String, String)> {
-        peer("", public_key, mesh_ip).to_facts()
+    /// The view of node-1, with `nodes` and node-1 itself.
+    fn view_of_node_1(nodes: Vec<Node>) -> ClusterView {
+        let mut view = ClusterView::empty("node-1");
+        let own = node(&peer("node-1", KEY_NODE_1, [10, 42, 0, 1]), Liveness::Live);
+        for node in std::iter::once(own).chain(nodes) {
+            view.nodes.insert(node.id.clone(), node);
+        }
+        view
     }
 
     #[test]
-    fn returns_every_other_node_with_valid_facts() {
-        let chitchat = chitchat_with_nodes(
-            &chitchat_id("node-1", 1),
-            facts(KEY_NODE_1, [10, 42, 0, 1]),
-            vec![(chitchat_id("node-2", 1), facts(KEY_NODE_2, [10, 42, 0, 2]))],
-        );
-        assert_eq!(
-            good_known_peers(&chitchat),
-            vec![peer("node-2", KEY_NODE_2, [10, 42, 0, 2])]
-        );
-    }
-
-    #[test]
-    fn skips_older_generations_of_the_own_node() {
-        let chitchat = chitchat_with_nodes(
-            &chitchat_id("node-1", 200),
-            facts(KEY_NODE_1_RESTARTED, [10, 42, 0, 1]),
-            vec![(
-                chitchat_id("node-1", 100),
-                facts(KEY_NODE_1, [10, 42, 0, 1]),
-            )],
-        );
-        assert!(good_known_peers(&chitchat).is_empty());
-    }
-
-    #[test]
-    fn skips_nodes_with_bad_or_missing_facts() {
-        let mut bad_ip = facts(KEY_NODE_2, [10, 42, 0, 2]);
-        bad_ip[1].1 = "not an ip".to_string();
-        let chitchat = chitchat_with_nodes(
-            &chitchat_id("node-1", 1),
-            facts(KEY_NODE_1, [10, 42, 0, 1]),
-            vec![
-                (chitchat_id("node-2", 1), bad_ip),
-                (chitchat_id("node-3", 1), key_values(&[("unrelated", "x")])),
-                (chitchat_id("node-4", 1), facts(KEY_NODE_2, [10, 42, 0, 4])),
-            ],
-        );
-        assert_eq!(
-            good_known_peers(&chitchat),
-            vec![peer("node-4", KEY_NODE_2, [10, 42, 0, 4])]
-        );
+    fn returns_every_other_node_live_or_dead() {
+        let node_2 = peer("node-2", KEY_NODE_2, [10, 42, 0, 2]);
+        let node_3 = peer("node-3", KEY_NODE_1_RESTARTED, [10, 42, 0, 3]);
+        let view = view_of_node_1(vec![
+            node(&node_2, Liveness::Live),
+            node(&node_3, Liveness::Dead),
+        ]);
+        assert_eq!(good_known_peers(&view), vec![node_2, node_3]);
     }
 
     #[test]
     fn skips_nodes_that_left() {
-        let mut leaving = facts(KEY_NODE_2, [10, 42, 0, 2]);
-        leaving.push((LEAVING_KEY.to_string(), "true".to_string()));
-        let chitchat = chitchat_with_nodes(
-            &chitchat_id("node-1", 1),
-            facts(KEY_NODE_1, [10, 42, 0, 1]),
-            vec![(chitchat_id("node-2", 1), leaving)],
-        );
-        assert!(good_known_peers(&chitchat).is_empty());
+        let node_2 = peer("node-2", KEY_NODE_2, [10, 42, 0, 2]);
+        let view = view_of_node_1(vec![node(&node_2, Liveness::Leaving)]);
+        assert!(good_known_peers(&view).is_empty());
     }
 
     #[test]
-    fn takes_the_latest_generation_of_a_restarted_node() {
-        let chitchat = chitchat_with_nodes(
-            &chitchat_id("node-1", 1),
-            facts(KEY_NODE_1, [10, 42, 0, 1]),
-            vec![
-                // The node restarted with a new key.
-                (
-                    chitchat_id("node-2", 200),
-                    facts(KEY_NODE_2, [10, 42, 0, 2]),
-                ),
-                (
-                    chitchat_id("node-2", 100),
-                    facts(KEY_NODE_1, [10, 42, 0, 9]),
-                ),
-            ],
-        );
-        assert_eq!(
-            good_known_peers(&chitchat),
-            vec![peer("node-2", KEY_NODE_2, [10, 42, 0, 2])]
-        );
-    }
-
-    #[test]
-    fn a_leaving_latest_generation_hides_the_older_ones() {
-        // The old generation crashed, the new one left gracefully:
-        // the old key must not come back as a peer.
-        let mut leaving = facts(KEY_NODE_2, [10, 42, 0, 2]);
-        leaving.push((LEAVING_KEY.to_string(), "true".to_string()));
-        let chitchat = chitchat_with_nodes(
-            &chitchat_id("node-1", 1),
-            facts(KEY_NODE_1, [10, 42, 0, 1]),
-            vec![
-                (
-                    chitchat_id("node-2", 100),
-                    facts(KEY_NODE_1, [10, 42, 0, 9]),
-                ),
-                (chitchat_id("node-2", 200), leaving),
-            ],
-        );
-        assert!(good_known_peers(&chitchat).is_empty());
+    fn skips_nodes_with_bad_or_missing_facts() {
+        let mut bad_ip = node(&peer("node-2", KEY_NODE_2, [10, 42, 0, 2]), Liveness::Live);
+        bad_ip
+            .facts
+            .insert(MESH_IP_FACT.to_string(), "not an ip".to_string());
+        let no_facts = Node {
+            id: "node-3".to_string(),
+            generation: 1,
+            liveness: Liveness::Live,
+            facts: BTreeMap::new(),
+        };
+        let node_4 = peer("node-4", KEY_NODE_2, [10, 42, 0, 4]);
+        let view = view_of_node_1(vec![bad_ip, no_facts, node(&node_4, Liveness::Live)]);
+        assert_eq!(good_known_peers(&view), vec![node_4]);
     }
 }
