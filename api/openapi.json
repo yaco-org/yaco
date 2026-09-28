@@ -186,6 +186,52 @@
           }
         }
       }
+    },
+    "/v1/events": {
+      "get": {
+        "tags": [
+          "events"
+        ],
+        "summary": "Streams the changes of the cluster as server-sent events.",
+        "description": "Every event has one JSON `Event` in its `data` field.\nThe stream starts with a `snapshot`.\nA client that reads too slowly gets a new `snapshot` instead of the events that it missed.",
+        "operationId": "events",
+        "responses": {
+          "200": {
+            "description": "Endless stream of events",
+            "content": {
+              "text/event-stream": {
+                "schema": {
+                  "$ref": "#/components/schemas/Event"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/v1/nodes": {
+      "get": {
+        "tags": [
+          "nodes"
+        ],
+        "summary": "Returns all nodes of the cluster, as this node sees them.",
+        "operationId": "list_nodes",
+        "responses": {
+          "200": {
+            "description": "All nodes, in the order of their IDs",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "array",
+                  "items": {
+                    "$ref": "#/components/schemas/Node"
+                  }
+                }
+              }
+            }
+          }
+        }
+      }
     }
   },
   "components": {
@@ -249,10 +295,153 @@
             "example": "no container has the name \"web\""
           }
         }
+      },
+      "Event": {
+        "oneOf": [
+          {
+            "type": "object",
+            "description": "All nodes.\nThe first event of every stream,\nand again when the stream was too slow and missed events.",
+            "required": [
+              "nodes",
+              "type"
+            ],
+            "properties": {
+              "nodes": {
+                "type": "array",
+                "items": {
+                  "$ref": "#/components/schemas/Node"
+                }
+              },
+              "type": {
+                "type": "string",
+                "enum": [
+                  "snapshot"
+                ]
+              }
+            }
+          },
+          {
+            "type": "object",
+            "description": "A node ID that this node did not know.",
+            "required": [
+              "node",
+              "type"
+            ],
+            "properties": {
+              "node": {
+                "$ref": "#/components/schemas/Node"
+              },
+              "type": {
+                "type": "string",
+                "enum": [
+                  "node_added"
+                ]
+              }
+            }
+          },
+          {
+            "type": "object",
+            "description": "A known node changed: its liveness, its generation or its facts.\nA graceful leave is a change to `leaving`.",
+            "required": [
+              "node",
+              "type"
+            ],
+            "properties": {
+              "node": {
+                "$ref": "#/components/schemas/Node"
+              },
+              "type": {
+                "type": "string",
+                "enum": [
+                  "node_changed"
+                ]
+              }
+            }
+          },
+          {
+            "type": "object",
+            "description": "This node forgot the node:\nit was dead or leaving for longer than `cluster.dead_node_grace_period`.",
+            "required": [
+              "id",
+              "type"
+            ],
+            "properties": {
+              "id": {
+                "type": "string"
+              },
+              "type": {
+                "type": "string",
+                "enum": [
+                  "node_removed"
+                ]
+              }
+            }
+          }
+        ],
+        "description": "One event of the event stream.\n\nEvery stream starts with `snapshot`.\nThe other events carry the whole node, so a client can apply an event twice with no harm."
+      },
+      "Liveness": {
+        "type": "string",
+        "description": "Liveness of a node, as this node sees it.",
+        "enum": [
+          "live",
+          "dead",
+          "leaving"
+        ]
+      },
+      "Node": {
+        "type": "object",
+        "description": "One node of the cluster, as this node sees it.\nOnly the latest generation of each node ID is shown.",
+        "required": [
+          "id",
+          "generation",
+          "liveness",
+          "facts"
+        ],
+        "properties": {
+          "facts": {
+            "type": "object",
+            "description": "Facts that the node publishes about itself.",
+            "additionalProperties": {
+              "type": "string"
+            },
+            "propertyNames": {
+              "type": "string"
+            },
+            "example": {
+              "endpoint": "203.0.113.1:7281",
+              "mesh_ip": "10.42.58.124",
+              "wg_public_key": "ERERERERERERERERERERERERERERERERERERERERERE="
+            }
+          },
+          "generation": {
+            "type": "integer",
+            "format": "int64",
+            "description": "Start time of the agent, in seconds since the Unix epoch.\nA restarted node has a new generation.",
+            "example": 1790000000,
+            "minimum": 0
+          },
+          "id": {
+            "type": "string",
+            "description": "Node ID, chosen by the operator.",
+            "example": "n1"
+          },
+          "liveness": {
+            "$ref": "#/components/schemas/Liveness"
+          }
+        }
       }
     }
   },
   "tags": [
+    {
+      "name": "nodes",
+      "description": "Nodes of the cluster"
+    },
+    {
+      "name": "events",
+      "description": "Changes of the cluster"
+    },
     {
       "name": "containers",
       "description": "Container manifests"
