@@ -7,6 +7,7 @@
 mod tests;
 
 use std::collections::BTreeMap;
+use std::net::{Ipv4Addr, SocketAddr};
 
 use serde::{Deserialize, Serialize};
 use utoipa::ToSchema;
@@ -83,13 +84,28 @@ pub struct Node {
     #[schema(example = 1790000000)]
     pub generation: u64,
     pub liveness: Liveness,
-    /// Facts that the node publishes about itself.
-    #[schema(example = json!({
-        "wg_public_key": "ERERERERERERERERERERERERERERERERERERERERERE=",
-        "mesh_ip": "10.42.58.124",
-        "endpoint": "203.0.113.1:7281"
-    }))]
-    pub facts: BTreeMap<String, String>,
+    pub facts: NodeFacts,
+}
+
+/// Facts that a node publishes about itself.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, ToSchema)]
+pub struct NodeFacts {
+    /// Absent if the node published no mesh facts, or facts that this node cannot read.
+    pub mesh: Option<MeshFacts>,
+}
+
+/// How to reach a node over the mesh.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, ToSchema)]
+pub struct MeshFacts {
+    /// WireGuard public key of the mesh interface, base64.
+    #[schema(example = "ERERERERERERERERERERERERERERERERERERERERERE=")]
+    pub wg_public_key: String,
+    /// Address of the node inside the mesh.
+    #[schema(value_type = String, format = Ipv4, example = "10.42.58.124")]
+    pub mesh_ip: Ipv4Addr,
+    /// Public address and port of the mesh WireGuard interface.
+    #[schema(value_type = String, example = "203.0.113.1:7281")]
+    pub endpoint: SocketAddr,
 }
 
 /// One event of the event stream.

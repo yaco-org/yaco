@@ -6,8 +6,10 @@
 //! which the clients use too.
 //!
 //! The node and event operations read the cluster view (see `view`).
+//! Its internal types become `yaco-api` types only here, in `convert`.
 //! The container operations answer 501 Not Implemented for now.
 
+mod convert;
 mod tests;
 
 use std::convert::Infallible;
@@ -28,7 +30,7 @@ use yaco_api::{
     NODES_PATH, Node,
 };
 
-use crate::view::{self, ClusterView};
+use crate::view::{Change, ClusterView};
 
 /// Parts of the spec that do not come from the handlers.
 #[derive(OpenApi)]
@@ -50,7 +52,7 @@ struct ApiDoc;
 pub struct ApiState {
     pub view: watch::Receiver<ClusterView>,
     /// Only for `subscribe`: every event stream gets its own receiver.
-    pub events: broadcast::Sender<Event>,
+    pub changes: broadcast::Sender<Change>,
 }
 
 fn open_api_router() -> OpenApiRouter<ApiState> {
@@ -89,8 +91,7 @@ pub async fn serve(listener: TcpListener, state: ApiState) -> anyhow::Result<()>
     responses((status = 200, description = "All nodes, in the order of their IDs", body = Vec<Node>))
 )]
 async fn list_nodes(State(state): State<ApiState>) -> Json<Vec<Node>> {
-    let nodes = state.view.borrow().nodes.values().cloned().collect();
-    Json(nodes)
+    Json(convert::nodes(&state.view.borrow()))
 }
 
 /// Streams the changes of the cluster as server-sent events.
@@ -120,15 +121,15 @@ fn event_stream(state: ApiState) -> impl Stream<Item = Result<sse::Event, Infall
     // Subscribe before the snapshot, so that no change falls between them.
     // A change can then be in the snapshot and also come as an event.
     // That is no problem, because an event carries the whole node.
-    let receiver = state.events.subscribe();
-    let first = view::snapshot(&state.view.borrow());
+    let receiver = state.changes.subscribe();
+    let first = convert::snapshot(&state.view.borrow());
     let start = (Some(first), receiver, state.view);
     futures_util::stream::unfold(start, |(next, mut receiver, view)| async move {
         let event = match next {
             Some(event) => event,
             None => match receiver.recv().await {
-                Ok(event) => event,
-                Err(RecvError::Lagged(_)) => view::snapshot(&view.borrow()),
+                Ok(change) => Event::from(&change),
+                Err(RecvError::Lagged(_)) => convert::snapshot(&view.borrow()),
                 Err(RecvError::Closed) => return None,
             },
         };

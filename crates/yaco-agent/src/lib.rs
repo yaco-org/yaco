@@ -1,5 +1,6 @@
 pub mod api;
 pub mod config;
+pub mod facts;
 pub mod gossip;
 pub mod join;
 pub mod keys;

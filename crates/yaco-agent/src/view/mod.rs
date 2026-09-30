@@ -4,10 +4,13 @@
 //!
 //! - `watch<ClusterView>`: the latest view, for readers that need the current state
 //!   (the mesh peer sync, the membership log, `GET /v1/nodes`).
-//! - `broadcast<Event>`: the changes between two views, for readers that need every change
+//! - `broadcast<Change>`: the changes between two views, for readers that need every change
 //!   (the event stream `GET /v1/events`).
 //!
-//! `build` and `changes` are pure functions, so they are easy to test.
+//! The types here are internal. The API module converts them into the `yaco-api` types,
+//! so a change of the API does not change this module.
+//!
+//! `ClusterView::from_chitchat` and `get_view_changes` are pure functions, so they are easy to test.
 //! Membership hysteresis (architecture section 5.7) will go into `run` later.
 
 mod tests;
@@ -18,17 +21,45 @@ use std::time::Duration;
 
 use chitchat::{Chitchat, ChitchatHandle, ChitchatId};
 use tokio::sync::{Notify, broadcast, watch};
-use yaco_api::{Event, Liveness, Node};
 
+use crate::facts::Facts;
 use crate::gossip::LEAVING_KEY;
 
-/// Prefix of the fact keys in a chitchat namespace.
-/// The view shows the facts without it.
-pub const FACTS_PREFIX: &str = "facts/";
+/// How many changes the broadcast channel keeps for a slow reader.
+/// A reader that falls further behind must read the whole view again.
+pub const CHANGE_BUFFER: usize = 1024;
 
-/// How many events the broadcast channel keeps for a slow reader.
-/// A reader that falls further behind gets a new snapshot.
-pub const EVENT_BUFFER: usize = 1024;
+/// Liveness of a node, as this node sees it.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Liveness {
+    /// The failure detector hears the node.
+    Live,
+    /// The failure detector does not hear the node. It can come back.
+    Dead,
+    /// The node left the cluster gracefully.
+    Leaving,
+}
+
+/// One node, as this node sees it.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct NodeView {
+    pub id: String,
+    /// chitchat generation: the start time of the agent. A restart makes a new one.
+    pub generation: u64,
+    pub liveness: Liveness,
+    pub facts: Facts,
+}
+
+/// A change between two views.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum Change {
+    /// A node ID that the old view did not have.
+    Added(NodeView),
+    /// A node that differs from the old view: liveness, generation or facts.
+    Changed(NodeView),
+    /// A node ID that the new view does not have: chitchat forgot the node.
+    Removed(String),
+}
 
 /// All nodes that chitchat knows, as this node sees them.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -36,7 +67,7 @@ pub struct ClusterView {
     /// ID of this node.
     pub self_id: String,
     /// The latest generation of every node ID, this node included.
-    pub nodes: BTreeMap<String, Node>,
+    pub nodes: BTreeMap<String, NodeView>,
 }
 
 impl ClusterView {
@@ -87,18 +118,11 @@ impl ClusterView {
             } else {
                 Liveness::Dead
             };
-            let facts = state
-                .key_values()
-                .filter_map(|(key, value)| {
-                    let name = key.strip_prefix(FACTS_PREFIX)?;
-                    Some((name.to_string(), value.to_string()))
-                })
-                .collect();
-            let node = Node {
+            let node = NodeView {
                 id: node_id.to_string(),
                 generation: id.generation_id,
                 liveness,
-                facts,
+                facts: Facts::from_node_state(state),
             };
             nodes.insert(node_id.to_string(), node);
         }
@@ -110,34 +134,25 @@ impl ClusterView {
     }
 }
 
-/// Returns the events that turn `old` into `new`, in the order of the node IDs.
-pub fn get_view_changes(old: &ClusterView, new: &ClusterView) -> Vec<Event> {
-    let mut events = Vec::new();
+/// Returns the changes that turn `old` into `new`, in the order of the node IDs.
+pub fn get_view_changes(old: &ClusterView, new: &ClusterView) -> Vec<Change> {
+    let mut changes = Vec::new();
     for (id, node) in &new.nodes {
         match old.nodes.get(id) {
-            None => events.push(Event::NodeAdded { node: node.clone() }),
-            Some(old_node) if old_node != node => {
-                events.push(Event::NodeChanged { node: node.clone() })
-            }
+            None => changes.push(Change::Added(node.clone())),
+            Some(old_node) if old_node != node => changes.push(Change::Changed(node.clone())),
             Some(_) => {}
         }
     }
     for id in old.nodes.keys() {
         if !new.nodes.contains_key(id) {
-            events.push(Event::NodeRemoved { id: id.clone() });
+            changes.push(Change::Removed(id.clone()));
         }
     }
-    events
+    changes
 }
 
-/// The snapshot event of a view.
-pub fn snapshot(view: &ClusterView) -> Event {
-    Event::Snapshot {
-        nodes: view.nodes.values().cloned().collect(),
-    }
-}
-
-/// Keeps `view` equal to the chitchat state, and sends every change to `events`.
+/// Keeps `view` equal to the chitchat state, and sends every change to `changes`.
 ///
 /// Updates on every change of the live set, on every key change,
 /// and every `resync_interval`, to see the nodes that chitchat forgot.
@@ -145,7 +160,7 @@ pub fn snapshot(view: &ClusterView) -> Event {
 pub async fn run(
     handle: &ChitchatHandle,
     view: watch::Sender<ClusterView>,
-    events: broadcast::Sender<Event>,
+    changes: broadcast::Sender<Change>,
     resync_interval: Duration,
 ) {
     let key_changed = Arc::new(Notify::new());
@@ -162,14 +177,14 @@ pub async fn run(
         // The live set is only the trigger. Mark it as seen.
         watcher.borrow_and_update();
         let new = ClusterView::from_chitchat(&*handle.chitchat().lock().await);
-        let changes = get_view_changes(&view.borrow(), &new);
-        if !changes.is_empty() {
-            // The view first, so that a reader that gets an event
+        let new_changes = get_view_changes(&view.borrow(), &new);
+        if !new_changes.is_empty() {
+            // The view first, so that a reader that gets a change
             // and then reads the view sees the change.
             view.send_replace(new);
-            for event in changes {
+            for change in new_changes {
                 // An error only means that nobody listens now.
-                let _ = events.send(event);
+                let _ = changes.send(change);
             }
         }
 

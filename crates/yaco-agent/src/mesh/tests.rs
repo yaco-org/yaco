@@ -2,7 +2,8 @@
 
 use super::*;
 
-use std::collections::BTreeMap;
+use crate::facts::Facts;
+use crate::view::NodeView;
 
 // Base64 of 32 bytes of 0x11, of 0x22 and of 0x55,
 // so the keys are easy to tell apart at a glance.
@@ -115,56 +116,25 @@ fn own_facts_come_from_the_config() {
     assert_eq!(own.endpoint, "192.0.2.1:9001".parse().unwrap());
 }
 
-/// A node of the cluster view with the facts of `peer`.
-fn node(peer: &MeshPeer, liveness: Liveness) -> Node {
-    let facts = peer
-        .to_facts()
-        .into_iter()
-        .map(|(key, value)| (key.strip_prefix(FACTS_PREFIX).unwrap().to_string(), value))
-        .collect();
-    Node {
+/// A node of the cluster view with the mesh facts of `peer`.
+fn node(peer: &MeshPeer, liveness: Liveness) -> NodeView {
+    NodeView {
         id: peer.node_id.clone(),
         generation: 1,
         liveness,
-        facts,
+        facts: Facts {
+            mesh: Some(peer.to_facts()),
+        },
     }
 }
 
-mod from_node {
-    use super::*;
-
-    #[test]
-    fn facts_round_trip() {
-        let original = peer("node-1", KEY_NODE_1, [10, 42, 0, 1]);
-        let node = node(&original, Liveness::Live);
-        assert_eq!(MeshPeer::from_node(&node).unwrap(), original);
-    }
-
-    #[test]
-    fn bad_facts_are_errors() {
-        let parse = |pairs: &[(&str, &str)]| {
-            let node = Node {
-                id: "node-1".to_string(),
-                generation: 1,
-                liveness: Liveness::Live,
-                facts: pairs
-                    .iter()
-                    .map(|(name, value)| (name.to_string(), value.to_string()))
-                    .collect(),
-            };
-            MeshPeer::from_node(&node)
-        };
-        let key = (WG_PUBLIC_KEY_FACT, KEY_NODE_1);
-        let ip = (MESH_IP_FACT, "10.42.0.1");
-        let endpoint = (ENDPOINT_FACT, "192.0.2.1:7281");
-        assert!(parse(&[key, ip, endpoint]).is_ok());
-
-        assert!(parse(&[ip, endpoint]).is_err());
-        assert!(parse(&[(WG_PUBLIC_KEY_FACT, "not a key"), ip, endpoint]).is_err());
-        assert!(parse(&[key, (MESH_IP_FACT, "10.42.0"), endpoint]).is_err());
-        assert!(parse(&[key, ip]).is_err());
-        assert!(parse(&[key, ip, (ENDPOINT_FACT, "192.0.2.1")]).is_err());
-    }
+#[test]
+fn facts_round_trip() {
+    let original = peer("node-1", KEY_NODE_1, [10, 42, 0, 1]);
+    assert_eq!(
+        MeshPeer::from_facts("node-1", &original.to_facts()),
+        original
+    );
 }
 
 #[test]
@@ -240,7 +210,7 @@ mod good_known_peers {
     use super::*;
 
     /// The view of node-1, with `nodes` and node-1 itself.
-    fn view_of_node_1(nodes: Vec<Node>) -> ClusterView {
+    fn view_of_node_1(nodes: Vec<NodeView>) -> ClusterView {
         let mut view = ClusterView::empty("node-1");
         let own = node(&peer("node-1", KEY_NODE_1, [10, 42, 0, 1]), Liveness::Live);
         for node in std::iter::once(own).chain(nodes) {
@@ -268,19 +238,16 @@ mod good_known_peers {
     }
 
     #[test]
-    fn skips_nodes_with_bad_or_missing_facts() {
-        let mut bad_ip = node(&peer("node-2", KEY_NODE_2, [10, 42, 0, 2]), Liveness::Live);
-        bad_ip
-            .facts
-            .insert(MESH_IP_FACT.to_string(), "not an ip".to_string());
-        let no_facts = Node {
-            id: "node-3".to_string(),
+    fn skips_nodes_with_no_mesh_facts() {
+        // The node published no mesh facts, or ones that this node cannot read.
+        let no_facts = NodeView {
+            id: "node-2".to_string(),
             generation: 1,
             liveness: Liveness::Live,
-            facts: BTreeMap::new(),
+            facts: Facts::default(),
         };
-        let node_4 = peer("node-4", KEY_NODE_2, [10, 42, 0, 4]);
-        let view = view_of_node_1(vec![bad_ip, no_facts, node(&node_4, Liveness::Live)]);
-        assert_eq!(good_known_peers(&view), vec![node_4]);
+        let node_3 = peer("node-3", KEY_NODE_2, [10, 42, 0, 3]);
+        let view = view_of_node_1(vec![no_facts, node(&node_3, Liveness::Live)]);
+        assert_eq!(good_known_peers(&view), vec![node_3]);
     }
 }

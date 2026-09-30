@@ -2,38 +2,43 @@
 
 use super::*;
 
-use std::collections::BTreeMap;
+use defguard_wireguard_rs::key::Key;
 
-use yaco_api::Liveness;
+use crate::facts::{Facts, MeshFacts};
+use crate::view::{Liveness, NodeView};
 
 /// A running API server on 127.0.0.1 with `view`.
 /// Returns its base URL and the senders that the view task has in the agent.
 async fn start(
     view: ClusterView,
-    event_buffer: usize,
-) -> (String, watch::Sender<ClusterView>, broadcast::Sender<Event>) {
+    change_buffer: usize,
+) -> (
+    String,
+    watch::Sender<ClusterView>,
+    broadcast::Sender<Change>,
+) {
     let (view_tx, view_rx) = watch::channel(view);
-    let (events_tx, _) = broadcast::channel(event_buffer);
+    let (changes_tx, _) = broadcast::channel(change_buffer);
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let base = format!("http://{}", listener.local_addr().unwrap());
     let state = ApiState {
         view: view_rx,
-        events: events_tx.clone(),
+        changes: changes_tx.clone(),
     };
     tokio::spawn(serve(listener, state));
-    (base, view_tx, events_tx)
+    (base, view_tx, changes_tx)
 }
 
 fn client() -> reqwest::Client {
     reqwest::Client::builder().no_proxy().build().unwrap()
 }
 
-fn node(id: &str, liveness: Liveness) -> Node {
-    Node {
+fn node(id: &str, liveness: Liveness) -> NodeView {
+    NodeView {
         id: id.to_string(),
         generation: 1,
         liveness,
-        facts: BTreeMap::new(),
+        facts: Facts::default(),
     }
 }
 
@@ -143,42 +148,70 @@ async fn nodes_are_the_nodes_of_the_view() {
         .unwrap();
     assert_eq!(response.status(), StatusCode::OK);
     let nodes: Vec<Node> = response.json().await.unwrap();
-    assert_eq!(nodes, two_nodes().nodes.into_values().collect::<Vec<_>>());
+    assert_eq!(nodes, convert::nodes(&two_nodes()));
 }
 
 #[tokio::test]
-async fn event_stream_starts_with_a_snapshot_then_sends_every_event() {
-    let (base, _view, events) = start(two_nodes(), 16).await;
+async fn event_stream_starts_with_a_snapshot_then_sends_every_change() {
+    let (base, _view, changes) = start(two_nodes(), 16).await;
     let mut reader = read_events(&base).await;
 
-    assert_eq!(reader.next().await, view::snapshot(&two_nodes()));
+    assert_eq!(reader.next().await, convert::snapshot(&two_nodes()));
 
-    let event = Event::NodeChanged {
-        node: node("n2", Liveness::Live),
-    };
-    events.send(event.clone()).unwrap();
-    assert_eq!(reader.next().await, event);
+    let change = Change::Changed(node("n2", Liveness::Live));
+    changes.send(change.clone()).unwrap();
+    assert_eq!(reader.next().await, Event::from(&change));
 }
 
 #[tokio::test]
-async fn slow_stream_gets_a_new_snapshot_instead_of_the_missed_events() {
-    // The channel keeps only one event, so a reader that misses more lags.
-    let (base, view, events) = start(two_nodes(), 1).await;
+async fn slow_stream_gets_a_new_snapshot_instead_of_the_missed_changes() {
+    // The channel keeps only one change, so a reader that misses more lags.
+    let (base, view, changes) = start(two_nodes(), 1).await;
     let mut reader = read_events(&base).await;
     reader.next().await;
 
-    // Send a bunch of "missed" events about removing some nodes
+    // Send a bunch of "missed" changes about removing some nodes
     for id in ["n2", "n3", "n4"] {
-        events
-            .send(Event::NodeRemoved { id: id.to_string() })
-            .unwrap();
+        changes.send(Change::Removed(id.to_string())).unwrap();
     }
     // Force change the view to something testable.
     let mut changed = two_nodes();
     changed.nodes.remove("n2");
     view.send_replace(changed.clone());
 
-    assert_eq!(reader.next().await, view::snapshot(&changed));
+    assert_eq!(reader.next().await, convert::snapshot(&changed));
+}
+
+#[test]
+fn facts_become_api_facts() {
+    let node = NodeView {
+        facts: Facts {
+            mesh: Some(MeshFacts {
+                // Base64 of 32 bytes of 0x11.
+                wg_public_key: Key::try_from("ERERERERERERERERERERERERERERERERERERERERERE=")
+                    .unwrap(),
+                mesh_ip: "10.42.0.2".parse().unwrap(),
+                endpoint: "192.0.2.2:7281".parse().unwrap(),
+            }),
+        },
+        ..node("n2", Liveness::Leaving)
+    };
+    let json = serde_json::to_value(Node::from(&node)).unwrap();
+    assert_eq!(
+        json,
+        serde_json::json!({
+            "id": "n2",
+            "generation": 1,
+            "liveness": "leaving",
+            "facts": {
+                "mesh": {
+                    "wg_public_key": "ERERERERERERERERERERERERERERERERERERERERERE=",
+                    "mesh_ip": "10.42.0.2",
+                    "endpoint": "192.0.2.2:7281"
+                }
+            }
+        })
+    );
 }
 
 #[tokio::test]

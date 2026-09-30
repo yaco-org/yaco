@@ -1,23 +1,38 @@
 #![cfg(test)]
 
 use super::*;
+use crate::facts::MeshFacts;
 use crate::test_util::{chitchat_id, chitchat_with_nodes, key_values};
 
-fn node(id: &str, generation: u64, liveness: Liveness) -> Node {
-    Node {
+use defguard_wireguard_rs::key::Key;
+
+fn node(id: &str, generation: u64, liveness: Liveness) -> NodeView {
+    NodeView {
         id: id.to_string(),
         generation,
         liveness,
-        facts: BTreeMap::new(),
+        facts: Facts::default(),
     }
 }
 
-fn view(nodes: Vec<Node>) -> ClusterView {
+fn view(nodes: Vec<NodeView>) -> ClusterView {
     let mut view = ClusterView::empty("n1");
     for node in nodes {
         view.nodes.insert(node.id.clone(), node);
     }
     view
+}
+
+/// Facts with mesh facts that differ only in the mesh IP.
+fn facts_with_mesh_ip(mesh_ip: &str) -> Facts {
+    Facts {
+        mesh: Some(MeshFacts {
+            // Base64 of 32 bytes of 0x11.
+            wg_public_key: Key::try_from("ERERERERERERERERERERERERERERERERERERERERERE=").unwrap(),
+            mesh_ip: mesh_ip.parse().unwrap(),
+            endpoint: "192.0.2.1:7281".parse().unwrap(),
+        }),
+    }
 }
 
 /// `chitchat_with_nodes` adds the other nodes without heartbeats,
@@ -27,13 +42,13 @@ mod build {
 
     #[test]
     fn has_every_node_with_its_facts_and_liveness() {
+        let n2_facts = facts_with_mesh_ip("10.42.0.2");
+        let mut n2_key_values = n2_facts.to_key_values();
+        n2_key_values.push(("other".to_string(), "x".to_string()));
         let chitchat = chitchat_with_nodes(
             &chitchat_id("n1", 1),
-            key_values(&[("facts/mesh_ip", "10.42.0.1")]),
-            vec![(
-                chitchat_id("n2", 5),
-                key_values(&[("facts/mesh_ip", "10.42.0.2"), ("other", "x")]),
-            )],
+            facts_with_mesh_ip("10.42.0.1").to_key_values(),
+            vec![(chitchat_id("n2", 5), n2_key_values)],
         );
 
         let view = ClusterView::from_chitchat(&chitchat);
@@ -41,14 +56,14 @@ mod build {
         assert_eq!(view.self_id, "n1");
         assert_eq!(view.nodes.keys().collect::<Vec<_>>(), vec!["n1", "n2"]);
         assert_eq!(view.nodes["n1"].liveness, Liveness::Live);
-        let n2 = &view.nodes["n2"];
-        assert_eq!(n2.generation, 5);
-        assert_eq!(n2.liveness, Liveness::Dead);
-        // Only facts, without the prefix.
-        let facts: Vec<_> = n2.facts.iter().collect();
         assert_eq!(
-            facts,
-            vec![(&"mesh_ip".to_string(), &"10.42.0.2".to_string())]
+            view.nodes["n2"],
+            NodeView {
+                id: "n2".to_string(),
+                generation: 5,
+                liveness: Liveness::Dead,
+                facts: n2_facts,
+            }
         );
     }
 
@@ -61,7 +76,7 @@ mod build {
         );
         let view = ClusterView::from_chitchat(&chitchat);
         assert_eq!(view.nodes["n2"].liveness, Liveness::Leaving);
-        assert!(view.nodes["n2"].facts.is_empty());
+        assert_eq!(view.nodes["n2"].facts, Facts::default());
     }
 
     #[test]
@@ -73,17 +88,17 @@ mod build {
                 // The order does not matter.
                 (
                     chitchat_id("n2", 200),
-                    key_values(&[("facts/mesh_ip", "10.42.0.2")]),
+                    facts_with_mesh_ip("10.42.0.2").to_key_values(),
                 ),
                 (
                     chitchat_id("n2", 100),
-                    key_values(&[("facts/mesh_ip", "10.42.0.9")]),
+                    facts_with_mesh_ip("10.42.0.9").to_key_values(),
                 ),
             ],
         );
         let n2 = &ClusterView::from_chitchat(&chitchat).nodes["n2"];
         assert_eq!(n2.generation, 200);
-        assert_eq!(n2.facts["mesh_ip"], "10.42.0.2");
+        assert_eq!(n2.facts, facts_with_mesh_ip("10.42.0.2"));
     }
 
     #[test]
@@ -95,7 +110,7 @@ mod build {
             vec![
                 (
                     chitchat_id("n2", 100),
-                    key_values(&[("facts/mesh_ip", "10.42.0.9")]),
+                    facts_with_mesh_ip("10.42.0.9").to_key_values(),
                 ),
                 (chitchat_id("n2", 200), key_values(&[(LEAVING_KEY, "true")])),
             ],
@@ -136,30 +151,23 @@ mod changes {
         ]);
         assert_eq!(
             get_view_changes(&old, &new),
-            vec![Event::NodeAdded {
-                node: node("n2", 1, Liveness::Live)
-            }]
+            vec![Change::Added(node("n2", 1, Liveness::Live))]
         );
     }
 
     #[test]
     fn liveness_generation_and_facts_are_changes() {
         let old = view(vec![node("n2", 1, Liveness::Live)]);
-        let mut with_fact = node("n2", 1, Liveness::Live);
-        with_fact
-            .facts
-            .insert("mesh_ip".to_string(), "10.42.0.2".to_string());
+        let mut with_facts = node("n2", 1, Liveness::Live);
+        with_facts.facts = facts_with_mesh_ip("10.42.0.2");
         for changed in [
             node("n2", 1, Liveness::Dead),
             node("n2", 1, Liveness::Leaving),
             node("n2", 2, Liveness::Live),
-            with_fact,
+            with_facts,
         ] {
             let new = view(vec![changed.clone()]);
-            assert_eq!(
-                get_view_changes(&old, &new),
-                vec![Event::NodeChanged { node: changed }]
-            );
+            assert_eq!(get_view_changes(&old, &new), vec![Change::Changed(changed)]);
         }
     }
 
@@ -172,9 +180,7 @@ mod changes {
         let new = view(vec![node("n1", 1, Liveness::Live)]);
         assert_eq!(
             get_view_changes(&old, &new),
-            vec![Event::NodeRemoved {
-                id: "n2".to_string()
-            }]
+            vec![Change::Removed("n2".to_string())]
         );
     }
 
@@ -184,12 +190,12 @@ mod changes {
             node("n1", 1, Liveness::Live),
             node("n2", 1, Liveness::Dead),
         ]);
-        let events = get_view_changes(&ClusterView::empty("n1"), &new);
-        assert_eq!(events.len(), 2);
+        let changes = get_view_changes(&ClusterView::empty("n1"), &new);
+        assert_eq!(changes.len(), 2);
         assert!(
-            events
+            changes
                 .iter()
-                .all(|event| matches!(event, Event::NodeAdded { .. }))
+                .all(|change| matches!(change, Change::Added(_)))
         );
     }
 }

@@ -2,7 +2,8 @@
 //!
 //! chitchat runs over the mesh.
 //!
-//! Every node publishes its WireGuard facts in its own chitchat namespace.
+//! Every node publishes its WireGuard facts in its own chitchat namespace
+//! (`facts::MeshFacts`), and the cluster view carries them to `sync_peers`.
 //!
 //! `sync_peers` configures new peers from two sources:
 //!
@@ -40,16 +41,9 @@ use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use tokio::sync::{mpsc, watch};
 
-use yaco_api::{Liveness, Node};
-
 use crate::config::Config;
-use crate::view::{ClusterView, FACTS_PREFIX};
-
-/// Names of the facts that the mesh needs.
-/// In chitchat, the keys have the prefix `view::FACTS_PREFIX`.
-pub const WG_PUBLIC_KEY_FACT: &str = "wg_public_key";
-pub const MESH_IP_FACT: &str = "mesh_ip";
-pub const ENDPOINT_FACT: &str = "endpoint";
+use crate::facts::MeshFacts;
+use crate::view::{ClusterView, Liveness};
 
 /// One node of the mesh, as the WireGuard peer list needs it.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -73,42 +67,24 @@ impl MeshPeer {
         }
     }
 
-    /// Parses the facts of one node of the cluster view.
-    /// Received data can be malformed, so this never panics.
-    pub fn from_node(node: &Node) -> anyhow::Result<Self> {
-        let fact = |name: &str| {
-            node.facts
-                .get(name)
-                .with_context(|| format!("missing {name}"))
-        };
-        let public_key = fact(WG_PUBLIC_KEY_FACT)?;
-        let public_key = Key::try_from(public_key.as_str())
-            .map_err(|err| anyhow::anyhow!("bad {WG_PUBLIC_KEY_FACT}: {err}"))?;
-        let mesh_ip = fact(MESH_IP_FACT)?
-            .parse()
-            .with_context(|| format!("bad {MESH_IP_FACT}"))?;
-        let endpoint = fact(ENDPOINT_FACT)?
-            .parse()
-            .with_context(|| format!("bad {ENDPOINT_FACT}"))?;
-        Ok(Self {
-            node_id: node.id.clone(),
-            public_key,
-            mesh_ip,
-            endpoint,
-        })
+    /// The peer of node `node_id` with the mesh facts that it published.
+    pub fn from_facts(node_id: &str, facts: &MeshFacts) -> Self {
+        Self {
+            node_id: node_id.to_string(),
+            public_key: facts.wg_public_key.clone(),
+            mesh_ip: facts.mesh_ip,
+            endpoint: facts.endpoint,
+        }
     }
 
-    /// Returns the facts to publish for this node.
+    /// The mesh facts to publish for this node.
     /// The node ID is not a fact: chitchat has it in the node's `ChitchatId`.
-    pub fn to_facts(&self) -> Vec<(String, String)> {
-        [
-            (WG_PUBLIC_KEY_FACT, self.public_key.to_string()),
-            (MESH_IP_FACT, self.mesh_ip.to_string()),
-            (ENDPOINT_FACT, self.endpoint.to_string()),
-        ]
-        .into_iter()
-        .map(|(name, value)| (format!("{FACTS_PREFIX}{name}"), value))
-        .collect()
+    pub fn to_facts(&self) -> MeshFacts {
+        MeshFacts {
+            wg_public_key: self.public_key.clone(),
+            mesh_ip: self.mesh_ip,
+            endpoint: self.endpoint,
+        }
     }
 }
 
@@ -188,20 +164,16 @@ impl MeshSubnet {
 }
 
 /// Returns the peers of all other nodes of the view, live or dead.
-/// Skips the nodes that left gracefully,
-/// and skips (with a warning) nodes with bad or missing facts.
+/// Skips the nodes that left gracefully and the nodes with no mesh facts.
 fn good_known_peers(view: &ClusterView) -> Vec<MeshPeer> {
-    let mut peers = Vec::new();
-    for node in view.nodes.values() {
-        if node.id == view.self_id || node.liveness == Liveness::Leaving {
-            continue;
-        }
-        match MeshPeer::from_node(node) {
-            Ok(peer) => peers.push(peer),
-            Err(err) => tracing::warn!(node_id = %node.id, "skipping node with bad facts: {err:#}"),
-        }
-    }
-    peers
+    view.nodes
+        .values()
+        .filter(|node| node.id != view.self_id && node.liveness != Liveness::Leaving)
+        .filter_map(|node| {
+            let facts = node.facts.mesh.as_ref()?;
+            Some(MeshPeer::from_facts(&node.id, facts))
+        })
+        .collect()
 }
 
 /// Adds a peer to the queue of peers to configure.
