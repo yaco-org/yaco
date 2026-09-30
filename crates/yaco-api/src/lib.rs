@@ -24,6 +24,10 @@ pub const NODES_PATH: &str = "/v1/nodes";
 /// Stream of cluster events (server-sent events).
 pub const EVENTS_PATH: &str = "/v1/events";
 
+/// TCP port of the node API, on the mesh IP of every node.
+/// A protocol constant: a node must reach the API of other nodes, for example to forward a request.
+pub const API_PORT: u16 = 7284;
+
 /// Header with the sender of a write request.
 /// Every write request must have it (architecture section 5.3).
 pub const SENDER_HEADER: &str = "X-Yaco-Sender";

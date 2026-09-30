@@ -5,14 +5,14 @@ use std::net::SocketAddr;
 use std::time::Duration;
 
 use chitchat::ChitchatHandle;
-use yaco_agent::config::ClusterConfig;
+use yaco_agent::config::{ClusterConfig, TuningConfig};
 use yaco_agent::gossip;
 
 /// A short gossip interval keeps the tests fast.
-fn cluster() -> ClusterConfig {
-    ClusterConfig {
+fn tuning() -> TuningConfig {
+    TuningConfig {
         gossip_interval: Duration::from_millis(100),
-        ..ClusterConfig::default()
+        ..TuningConfig::default()
     }
 }
 
@@ -29,7 +29,7 @@ async fn start_cluster(names: &[&str], first_port: u16) -> Vec<ChitchatHandle> {
     for (i, name) in names.iter().enumerate() {
         let listen = addr(first_port + i as u16);
         let seeds = if i == 0 { vec![] } else { vec![seed] };
-        let config = gossip::config(name, listen, &seeds, &cluster());
+        let config = gossip::config(name, listen, &seeds, &tuning(), &ClusterConfig::default());
         handles.push(gossip::start(config, Vec::new()).await.unwrap());
     }
     handles
@@ -49,7 +49,7 @@ async fn wait_for_live(handles: &[ChitchatHandle], expected: &[&str], timeout: D
             if all_match {
                 return;
             }
-            tokio::time::sleep(cluster().gossip_interval).await;
+            tokio::time::sleep(tuning().gossip_interval).await;
         }
     })
     .await;
@@ -87,7 +87,7 @@ async fn leaving_node_is_removed_before_failure_detection() {
     );
 
     let node_3 = handles.pop().unwrap();
-    gossip::leave(node_3, &cluster()).await.unwrap();
+    gossip::leave(node_3, &tuning()).await.unwrap();
 
     // The failure detector needs several seconds to mark a node dead.
     // A graceful leave must be visible much sooner.

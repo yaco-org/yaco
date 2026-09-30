@@ -12,14 +12,19 @@ use chitchat::{
     spawn_chitchat,
 };
 
-use crate::config::ClusterConfig;
+use crate::config::{ClusterConfig, TuningConfig};
 
 /// A node sets this key just before it shuts down.
 /// Other nodes then remove it from the live set at once,
 /// instead of after the failure detector timeout.
 pub const LEAVING_KEY: &str = "leaving";
 
-/// Builds a chitchat config from the cluster config.
+/// UDP port of chitchat, on the mesh IP only.
+/// A protocol constant: it is inside the mesh, so nobody needs to change it,
+/// and a node with another port could not gossip with the others.
+pub const GOSSIP_PORT: u16 = 7280;
+
+/// Builds a chitchat config from the tuning and cluster values.
 ///
 /// `seeds` are gossip addresses of other nodes.
 /// An empty list starts a new cluster.
@@ -27,19 +32,20 @@ pub fn config(
     node_id: &str,
     listen_addr: SocketAddr,
     seeds: &[SocketAddr],
+    tuning: &TuningConfig,
     cluster: &ClusterConfig,
 ) -> ChitchatConfig {
     ChitchatConfig {
         chitchat_id: ChitchatId::new(node_id, generation_id(), listen_addr),
         cluster_id: cluster.cluster_id.clone(),
-        gossip_interval: cluster.gossip_interval,
+        gossip_interval: tuning.gossip_interval,
         listen_addr,
         seed_nodes: seeds.iter().map(|addr| addr.to_string()).collect(),
         failure_detector_config: FailureDetectorConfig {
-            phi_threshold: cluster.phi_threshold,
-            sampling_window_size: cluster.sampling_window_size,
-            max_interval: cluster.max_heartbeat_interval,
-            initial_interval: cluster.initial_heartbeat_interval,
+            phi_threshold: tuning.phi_threshold,
+            sampling_window_size: tuning.sampling_window_size,
+            max_interval: tuning.max_heartbeat_interval,
+            initial_interval: tuning.initial_heartbeat_interval,
             // chitchat keeps a dead node this long, and so its WireGuard peer,
             // so that a node cut off by the network can come back without a restart.
             // After this, the node must restart and join again.
@@ -66,11 +72,11 @@ pub async fn start(
 
 /// Leaves the cluster gracefully and stops chitchat.
 /// Waits `leave_rounds` gossip rounds, so that `LEAVING_KEY` reaches the other nodes.
-pub async fn leave(handle: ChitchatHandle, cluster: &ClusterConfig) -> anyhow::Result<()> {
+pub async fn leave(handle: ChitchatHandle, tuning: &TuningConfig) -> anyhow::Result<()> {
     handle
         .with_chitchat(|chitchat| chitchat.self_node_state().set(LEAVING_KEY, "true"))
         .await;
-    tokio::time::sleep(cluster.gossip_interval * cluster.leave_rounds).await;
+    tokio::time::sleep(tuning.gossip_interval * tuning.leave_rounds).await;
     handle.shutdown().await
 }
 

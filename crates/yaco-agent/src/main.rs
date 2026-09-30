@@ -75,15 +75,20 @@ async fn main() -> anyhow::Result<()> {
         new_peers_tx.send(peer)?;
     }
 
-    let gossip_addr = SocketAddr::new(IpAddr::V4(own_facts.mesh_ip), config.cluster.gossip_port);
-    let chitchat_config =
-        gossip::config(&config.node.id, gossip_addr, &gossip_seeds, &config.cluster);
+    let gossip_addr = SocketAddr::new(IpAddr::V4(own_facts.mesh_ip), gossip::GOSSIP_PORT);
+    let chitchat_config = gossip::config(
+        &config.node.id,
+        gossip_addr,
+        &gossip_seeds,
+        &config.tuning,
+        &config.cluster,
+    );
     let own = Facts {
         mesh: Some(own_facts.to_facts()),
     };
     let handle = gossip::start(chitchat_config, own.to_key_values()).await?;
 
-    let api_addr = SocketAddr::new(IpAddr::V4(own_facts.mesh_ip), config.cluster.api_port);
+    let api_addr = SocketAddr::new(IpAddr::V4(own_facts.mesh_ip), api::API_PORT);
     let api_listener = TcpListener::bind(api_addr)
         .await
         .with_context(|| format!("cannot bind the node API to {api_addr}"))?;
@@ -113,9 +118,9 @@ async fn main() -> anyhow::Result<()> {
     let result = tokio::select! {
         _ = async {
             tokio::join!(
-                view::run(&handle, view_tx, changes_tx.clone(), config.cluster.peer_resync_interval),
+                view::run(&handle, view_tx, changes_tx.clone(), config.tuning.peer_resync_interval),
                 view::log_membership(view_rx.clone()),
-                mesh::sync_peers(view_rx.clone(), &mut mesh, new_peers_rx, peers_tx, config.cluster.peer_resync_interval),
+                mesh::sync_peers(view_rx.clone(), &mut mesh, new_peers_rx, peers_tx, config.tuning.peer_resync_interval),
             )
         } => {
             tracing::error!("chitchat stopped");
@@ -131,7 +136,7 @@ async fn main() -> anyhow::Result<()> {
         }
         _ = tokio::signal::ctrl_c() => {
             tracing::info!("leaving the cluster");
-            gossip::leave(handle, &config.cluster).await
+            gossip::leave(handle, &config.tuning).await
         }
     };
 

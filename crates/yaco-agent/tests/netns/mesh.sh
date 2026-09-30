@@ -32,10 +32,11 @@ NODES="1 2 3"
 TOKEN="netns-test-token-0123456789"
 WRONG_TOKEN="netns-test-token-wrong-9876"
 
-# The script writes these values into the config files and checks them later,
-# so the test does not depend on the defaults of the agent.
+# Fixed ports of the agent, inside the mesh. They are not configurable.
 GOSSIP_PORT=7280
 API_PORT=7284
+# The script writes these values into the config files and checks them later,
+# so the test does not depend on the defaults of the agent.
 BOOT_PORT=7282
 MESH_INTERFACE=yaco-test-mesh
 
@@ -87,8 +88,6 @@ boot_port = $BOOT_PORT
 mesh_interface = "$MESH_INTERFACE"
 
 [cluster]
-gossip_port = $GOSSIP_PORT
-api_port = $API_PORT
 $3
 EOF
 }
@@ -113,7 +112,7 @@ write_config 4 "\"10.99.0.1:$BOOT_PORT\"" ""
 YACO_TOKEN=$WRONG_TOKEN ip netns exec n4 "$AGENT" --config "$LOG_DIR/n4.toml" \
   >"$LOG_DIR/n4.log" 2>&1 &
 intruder_pid=$!
-write_config 5 "\"10.99.0.1:$BOOT_PORT\"" 'gossip_interval = "2s"'
+write_config 5 "\"10.99.0.1:$BOOT_PORT\"" 'dead_node_grace_period = "2days"'
 YACO_TOKEN=$TOKEN ip netns exec n5 "$AGENT" --config "$LOG_DIR/n5.toml" \
   >"$LOG_DIR/n5.log" 2>&1 &
 mismatch_pid=$!

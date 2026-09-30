@@ -116,7 +116,7 @@ mod check_join {
     #[test]
     fn other_cluster_config_is_refused() {
         let mut other = cluster();
-        other.gossip_interval *= 2;
+        other.dead_node_grace_period *= 2;
         let mut request = request("node-3", KEY_NODE_3, [10, 42, 0, 3]);
         request.config_fingerprint = other.fingerprint();
         assert_eq!(check(&request), Err(JoinRefusal::ConfigMismatch));
@@ -246,7 +246,7 @@ mod handle_join {
     async fn other_config_is_a_bad_request() {
         let mut seed = seed();
         let mut other = cluster();
-        other.mtu -= 1;
+        other.dead_node_grace_period *= 2;
         let mut request = request("node-3", KEY_NODE_3, [10, 42, 0, 3]);
         request.config_fingerprint = other.fingerprint();
 

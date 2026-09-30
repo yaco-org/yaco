@@ -10,9 +10,9 @@ id = "node-1"
 public_ip = "192.0.2.1"
 "#;
 
-/// A minimal file plus one more line in the `[cluster]` table.
-fn with_cluster_line(line: &str) -> String {
-    format!("{MINIMAL}\n[cluster]\n{line}\n")
+/// A minimal file plus one more line in the table `table`.
+fn with_line(table: &str, line: &str) -> String {
+    format!("{MINIMAL}\n[{table}]\n{line}\n")
 }
 
 #[test]
@@ -28,6 +28,7 @@ fn minimal_file_gets_the_defaults() {
     assert_eq!(config.node.boot_port, default_boot_port());
     assert_eq!(config.node.mesh_interface, default_mesh_interface());
     assert_eq!(config.node.boot_interface, default_boot_interface());
+    assert_eq!(config.tuning, TuningConfig::default());
     assert_eq!(config.cluster, ClusterConfig::default());
 }
 
@@ -35,6 +36,7 @@ fn minimal_file_gets_the_defaults() {
 fn example_file_is_valid_and_shows_the_defaults() {
     let text = EXAMPLE;
     let config = Config::parse(text).unwrap();
+    assert_eq!(config.tuning, TuningConfig::default());
     assert_eq!(config.cluster, ClusterConfig::default());
     assert_eq!(config.node.mesh_port, default_mesh_port());
     assert_eq!(config.node.boot_port, default_boot_port());
@@ -51,9 +53,11 @@ public_ip = "192.0.2.2"
 seeds = ["192.0.2.1:7282", "192.0.2.3:9000"]
 mesh_port = 9001
 
+[tuning]
+gossip_interval = "250ms"
+
 [cluster]
 mesh_subnet = "192.168.0.0/24"
-gossip_interval = "250ms"
 "#;
     let config = Config::parse(text).unwrap();
     assert_eq!(
@@ -64,11 +68,11 @@ gossip_interval = "250ms"
         ]
     );
     assert_eq!(config.node.mesh_port, 9001);
+    assert_eq!(config.tuning.gossip_interval, Duration::from_millis(250));
     assert_eq!(
         config.cluster.mesh_subnet,
         "192.168.0.0/24".parse().unwrap()
     );
-    assert_eq!(config.cluster.gossip_interval, Duration::from_millis(250));
 }
 
 #[test]
@@ -81,8 +85,30 @@ fn required_node_values_are_required() {
 #[test]
 fn unknown_keys_are_errors() {
     assert!(Config::parse(&format!("{MINIMAL}typo = 1\n")).is_err());
-    assert!(Config::parse(&with_cluster_line("gossip_intervall = \"1s\"")).is_err());
+    assert!(Config::parse(&with_line("tuning", "gossip_intervall = \"1s\"")).is_err());
+    assert!(Config::parse(&with_line("cluster", "mesh_subnett = \"10.42.0.0/16\"")).is_err());
     assert!(Config::parse(&format!("{MINIMAL}\n[extra]\n")).is_err());
+}
+
+#[test]
+fn moved_and_removed_keys_are_errors() {
+    // These keys were in [cluster] before. A file with them fails,
+    // so that the operator sees the change and does not lose a value.
+    for line in [
+        "mtu = 1400",
+        "gossip_interval = \"1s\"",
+        "join_rounds = 5",
+        // Protocol constants now.
+        "gossip_port = 7280",
+        "join_port = 7283",
+        "api_port = 7284",
+        "boot_subnet = \"169.254.42.0/30\"",
+    ] {
+        assert!(
+            Config::parse(&with_line("cluster", line)).is_err(),
+            "accepted in [cluster]: {line}"
+        );
+    }
 }
 
 #[test]
@@ -95,17 +121,25 @@ fn invalid_values_are_errors() {
         // Contains the fixed bootstrap addresses.
         "mesh_subnet = \"169.254.0.0/16\"",
         "mesh_subnet = \"169.254.42.0/30\"",
-        // No longer configurable.
-        "boot_subnet = \"169.254.42.0/30\"",
-        "gossip_interval = \"0s\"",
-        "join_rounds = 0",
-        "max_mesh_ip_attempts = 0",
         "cluster_id = \"\"",
-        "gossip_interval = \"soon\"",
+        "dead_node_grace_period = \"soon\"",
     ];
     for line in bad_cluster_lines {
         assert!(
-            Config::parse(&with_cluster_line(line)).is_err(),
+            Config::parse(&with_line("cluster", line)).is_err(),
+            "accepted: {line}"
+        );
+    }
+
+    let bad_tuning_lines = [
+        "gossip_interval = \"0s\"",
+        "gossip_interval = \"soon\"",
+        "join_rounds = 0",
+        "max_mesh_ip_attempts = 0",
+    ];
+    for line in bad_tuning_lines {
+        assert!(
+            Config::parse(&with_line("tuning", line)).is_err(),
             "accepted: {line}"
         );
     }
@@ -124,9 +158,14 @@ fn invalid_values_are_errors() {
 
 #[test]
 fn fingerprint_ignores_formatting_and_key_order() {
-    let a = Config::parse(&with_cluster_line("gossip_interval = \"2s\"\nmtu = 1400")).unwrap();
-    let b = Config::parse(&with_cluster_line(
-        "# a comment\nmtu    =   1400\n\ngossip_interval = \"2000ms\"",
+    let a = Config::parse(&with_line(
+        "cluster",
+        "cluster_id = \"a\"\ndead_node_grace_period = \"2h\"",
+    ))
+    .unwrap();
+    let b = Config::parse(&with_line(
+        "cluster",
+        "# a comment\ndead_node_grace_period =   \"120m\"\n\ncluster_id = \"a\"",
     ))
     .unwrap();
     assert_eq!(a.cluster.fingerprint(), b.cluster.fingerprint());
@@ -137,17 +176,12 @@ fn fingerprint_changes_with_any_cluster_value() {
     let base = ClusterConfig::default().fingerprint();
     let changed_lines = [
         "mesh_subnet = \"10.43.0.0/16\"",
-        "mtu = 1400",
-        "peer_resync_interval = \"31s\"",
         "cluster_id = \"other\"",
-        "gossip_port = 7290",
-        "phi_threshold = 9.0",
-        "join_port = 7293",
-        "max_mesh_ip_attempts = 17",
-        "api_port = 7294",
+        "dead_node_grace_period = \"2days\"",
+        "tombstone_grace_period = \"2h\"",
     ];
     for line in changed_lines {
-        let config = Config::parse(&with_cluster_line(line)).unwrap();
+        let config = Config::parse(&with_line("cluster", line)).unwrap();
         assert_ne!(
             config.cluster.fingerprint(),
             base,
@@ -157,7 +191,7 @@ fn fingerprint_changes_with_any_cluster_value() {
 }
 
 #[test]
-fn fingerprint_does_not_depend_on_node_values() {
+fn fingerprint_does_not_depend_on_node_or_tuning_values() {
     let a = Config::parse(MINIMAL).unwrap();
     let text = r#"
 [node]
@@ -165,12 +199,17 @@ id = "node-9"
 public_ip = "198.51.100.9"
 seeds = ["192.0.2.1:7282"]
 mesh_port = 9001
+
+[tuning]
+mtu = 1280
+gossip_interval = "2s"
+join_rounds = 9
 "#;
     let b = Config::parse(text).unwrap();
     assert_eq!(a.cluster.fingerprint(), b.cluster.fingerprint());
 }
 
-/// Collects the dotted paths of all keys in `value`, for example `cluster.mtu`.
+/// Collects the dotted paths of all keys in `value`, for example `tuning.mtu`.
 /// Arrays are values, so their items are not keys.
 fn key_paths(value: &toml::Value, prefix: &str, paths: &mut Vec<String>) {
     if let toml::Value::Table(table) = value {

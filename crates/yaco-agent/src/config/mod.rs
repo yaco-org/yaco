@@ -1,8 +1,10 @@
 //! Agent configuration, read from one TOML file.
 //!
-//! The file has two tables:
+//! The file has three tables:
 //!
 //! - `[node]`: values of this node only, for example its ID and public IP.
+//! - `[tuning]`: timing and retry values of this node.
+//!   Nodes can have different values.
 //! - `[cluster]`: values that must be the same on every node.
 //!   A joining node sends the fingerprint of its `[cluster]` table,
 //!   and the seed refuses the join if the fingerprint differs from its own.
@@ -34,6 +36,8 @@ const MAX_INTERFACE_NAME_LEN: usize = 15;
 #[serde(deny_unknown_fields)]
 pub struct Config {
     pub node: NodeConfig,
+    #[serde(default)]
+    pub tuning: TuningConfig,
     #[serde(default)]
     pub cluster: ClusterConfig,
 }
@@ -80,17 +84,13 @@ fn default_boot_interface() -> String {
     "yaco-boot".to_string()
 }
 
-/// Values that must be the same on every node.
-///
-/// Cluster fingerprint is built out of the values of these fields.
-/// Changing the fields changes the fingerprint,
-/// so nodes of the old and the new version cannot join each other.
+/// Timing and retry values of this node.
+/// Nodes can have different values: a difference changes only the behavior of this node.
+/// Not part of the cluster fingerprint.
 #[derive(Clone, Debug, PartialEq, Deserialize, Serialize)]
 #[serde(default, deny_unknown_fields)]
-pub struct ClusterConfig {
+pub struct TuningConfig {
     // Mesh.
-    /// Subnet of the mesh IPs.
-    pub mesh_subnet: MeshSubnet,
     /// MTU of both WireGuard interfaces.
     pub mtu: u32,
     /// How often the peer list is synchronized without a membership change.
@@ -98,22 +98,11 @@ pub struct ClusterConfig {
     pub peer_resync_interval: Duration,
 
     // Gossip.
-    /// chitchat ignores messages with another cluster ID.
-    pub cluster_id: String,
-    /// UDP port of chitchat, on the mesh IP.
-    pub gossip_port: u16,
     #[serde(with = "humantime_serde")]
     pub gossip_interval: Duration,
-    /// Gossip rounds to wait after a node marks itself as leaving,
+    /// Gossip rounds to wait after this node marks itself as leaving,
     /// so that the mark reaches the other nodes.
     pub leave_rounds: u32,
-    /// How long chitchat keeps a dead node, and so its WireGuard peer.
-    /// A node that comes back later must restart and join again.
-    #[serde(with = "humantime_serde")]
-    pub dead_node_grace_period: Duration,
-    /// How long chitchat keeps deleted keys.
-    #[serde(with = "humantime_serde")]
-    pub tombstone_grace_period: Duration,
     /// Failure detector: phi value above which a node is dead.
     pub phi_threshold: f64,
     /// Failure detector: number of heartbeat intervals to keep.
@@ -126,53 +115,70 @@ pub struct ClusterConfig {
     pub initial_heartbeat_interval: Duration,
 
     // Join.
-    /// TCP port of the join endpoint, inside the bootstrap tunnel.
-    pub join_port: u16,
     /// Timeout of one join request, WireGuard handshake included.
     #[serde(with = "humantime_serde")]
     pub join_request_timeout: Duration,
-    /// How often a joining node tries all seeds before it gives up.
+    /// How often this node tries all seeds before it gives up.
     pub join_rounds: u32,
     /// Pause between two join rounds.
     /// A random part of up to the same length is added,
     /// so that two nodes that join through the same seed do not collide again.
     #[serde(with = "humantime_serde")]
     pub join_retry_delay: Duration,
-    /// How many mesh IPs a joining node proposes to one seed before it gives up.
+    /// How many mesh IPs this node proposes to one seed before it gives up.
     pub max_mesh_ip_attempts: u32,
-
-    // Node API.
-    /// TCP port of the node API, on the mesh IP.
-    /// The same on every node, so that a node can forward a request to another node.
-    pub api_port: u16,
 }
 
-impl Default for ClusterConfig {
+impl Default for TuningConfig {
     fn default() -> Self {
-        ClusterConfig {
-            mesh_subnet: "10.42.0.0/16".parse().unwrap(),
+        TuningConfig {
             mtu: 1420,
             peer_resync_interval: Duration::from_secs(30),
 
-            cluster_id: "yaco".to_string(),
-            gossip_port: 7280,
             gossip_interval: Duration::from_secs(1),
             leave_rounds: 3,
-            dead_node_grace_period: Duration::from_secs(24 * 60 * 60),
-            tombstone_grace_period: Duration::from_secs(60 * 60),
             // The chitchat defaults.
             phi_threshold: 8.0,
             sampling_window_size: 1000,
             max_heartbeat_interval: Duration::from_secs(10),
             initial_heartbeat_interval: Duration::from_secs(5),
 
-            join_port: 7283,
             join_request_timeout: Duration::from_secs(5),
             join_rounds: 5,
             join_retry_delay: Duration::from_secs(5),
             max_mesh_ip_attempts: 16,
+        }
+    }
+}
 
-            api_port: 7284,
+/// Values that must be the same on every node.
+///
+/// Cluster fingerprint is built out of the values of these fields.
+/// Changing the fields changes the fingerprint,
+/// so nodes of the old and the new version cannot join each other.
+#[derive(Clone, Debug, PartialEq, Deserialize, Serialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct ClusterConfig {
+    /// Subnet of the mesh IPs.
+    pub mesh_subnet: MeshSubnet,
+    /// chitchat ignores messages with another cluster ID.
+    pub cluster_id: String,
+    /// How long chitchat keeps a dead node, and so its WireGuard peer.
+    /// A node that comes back later must restart and join again.
+    #[serde(with = "humantime_serde")]
+    pub dead_node_grace_period: Duration,
+    /// How long chitchat keeps deleted keys.
+    #[serde(with = "humantime_serde")]
+    pub tombstone_grace_period: Duration,
+}
+
+impl Default for ClusterConfig {
+    fn default() -> Self {
+        ClusterConfig {
+            mesh_subnet: "10.42.0.0/16".parse().unwrap(),
+            cluster_id: "yaco".to_string(),
+            dead_node_grace_period: Duration::from_secs(24 * 60 * 60),
+            tombstone_grace_period: Duration::from_secs(60 * 60),
         }
     }
 }
@@ -194,6 +200,7 @@ impl Config {
 
     fn validate(&self) -> anyhow::Result<()> {
         let node = &self.node;
+        let tuning = &self.tuning;
         let cluster = &self.cluster;
 
         anyhow::ensure!(!node.id.is_empty(), "node.id is empty");
@@ -225,16 +232,16 @@ impl Config {
             "cluster.cluster_id is empty"
         );
         anyhow::ensure!(
-            !cluster.gossip_interval.is_zero(),
-            "cluster.gossip_interval must be more than zero"
+            !tuning.gossip_interval.is_zero(),
+            "tuning.gossip_interval must be more than zero"
         );
         anyhow::ensure!(
-            cluster.join_rounds > 0,
-            "cluster.join_rounds must be more than zero"
+            tuning.join_rounds > 0,
+            "tuning.join_rounds must be more than zero"
         );
         anyhow::ensure!(
-            cluster.max_mesh_ip_attempts > 0,
-            "cluster.max_mesh_ip_attempts must be more than zero"
+            tuning.max_mesh_ip_attempts > 0,
+            "tuning.max_mesh_ip_attempts must be more than zero"
         );
         Ok(())
     }

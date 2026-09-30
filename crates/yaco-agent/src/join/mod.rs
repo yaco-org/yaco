@@ -44,6 +44,10 @@ pub const BOOT_SERVER_IP: Ipv4Addr = Ipv4Addr::new(169, 254, 42, 1);
 pub const BOOT_CLIENT_IP: Ipv4Addr = Ipv4Addr::new(169, 254, 42, 2);
 pub const BOOT_PREFIX_LEN: u8 = 30;
 
+/// TCP port of the join endpoint, inside the bootstrap tunnel.
+/// A protocol constant, like the bootstrap addresses: a joining node must know it in advance.
+pub const JOIN_PORT: u16 = 7283;
+
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct JoinRequest {
     /// `[cluster]` config fingerprint of the joining node.
@@ -116,7 +120,7 @@ pub struct Bootstrap {
     api: WGApi<Kernel>,
     interface: String,
     port: u16,
-    cluster: ClusterConfig,
+    mtu: u32,
 }
 
 impl Bootstrap {
@@ -131,7 +135,7 @@ impl Bootstrap {
             api,
             interface,
             port: config.node.boot_port,
-            cluster: config.cluster.clone(),
+            mtu: config.tuning.mtu,
         })
     }
 
@@ -160,7 +164,7 @@ impl Bootstrap {
                 addresses: vec![IpAddrMask::new(IpAddr::V4(ip), BOOT_PREFIX_LEN)],
                 port: self.port,
                 peers: vec![peer],
-                mtu: Some(self.cluster.mtu),
+                mtu: Some(self.mtu),
                 fwmark: None,
             })
             .with_context(|| format!("cannot configure interface {}", self.interface))
@@ -206,12 +210,8 @@ pub async fn serve(server: JoinServer) -> anyhow::Result<()> {
     // that arrive on another interface, outside the tunnel.
     socket.bind_device(Some(server.config.node.boot_interface.as_bytes()))?;
     socket.set_reuseaddr(true)?;
-    let cluster = &server.config.cluster;
     socket
-        .bind(SocketAddr::new(
-            IpAddr::V4(BOOT_SERVER_IP),
-            cluster.join_port,
-        ))
+        .bind(SocketAddr::new(IpAddr::V4(BOOT_SERVER_IP), JOIN_PORT))
         .context("cannot bind the join endpoint")?;
     let listener = socket.listen(16)?;
 
@@ -276,23 +276,23 @@ pub async fn join(
     config: &Config,
     public_key: &Key,
 ) -> anyhow::Result<(MeshPeer, JoinResponse)> {
-    let cluster = &config.cluster;
-    let config_fingerprint = cluster.fingerprint();
+    let tuning = &config.tuning;
+    let config_fingerprint = config.cluster.fingerprint();
     let client = reqwest::Client::builder()
-        .timeout(cluster.join_request_timeout)
+        .timeout(tuning.join_request_timeout)
         // So that we don't proxy join requests through an unrelated proxy.
         .no_proxy()
         .build()?;
-    let url = format!("http://{BOOT_SERVER_IP}:{}/join", cluster.join_port);
+    let url = format!("http://{BOOT_SERVER_IP}:{JOIN_PORT}/join");
 
-    for round in 0..cluster.join_rounds {
+    for round in 0..tuning.join_rounds {
         if round > 0 {
-            tokio::time::sleep(with_jitter(cluster.join_retry_delay)).await;
+            tokio::time::sleep(with_jitter(tuning.join_retry_delay)).await;
         }
         for &seed in &config.node.seeds {
             boot.set_client(keys, seed)?;
             let mut attempt = 0;
-            while attempt < cluster.max_mesh_ip_attempts {
+            while attempt < tuning.max_mesh_ip_attempts {
                 let peer = MeshPeer::own(config, public_key, attempt);
                 let request = JoinRequest {
                     config_fingerprint: config_fingerprint.clone(),

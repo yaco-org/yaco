@@ -1,6 +1,10 @@
 # Example config of the YACO agent.
 # Every value except node.id and node.public_ip has the default shown here.
 # The join token is not in this file. Set it in the YACO_TOKEN environment variable.
+#
+# The ports inside the mesh are fixed:
+# gossip UDP 7280 and node API TCP 7284 on the mesh IP,
+# and the join endpoint TCP 7283 inside the bootstrap tunnel.
 
 [node]
 # Unique ID of this node in the cluster.
@@ -18,42 +22,39 @@ boot_port = 7282
 mesh_interface = "yaco-mesh"
 boot_interface = "yaco-boot"
 
-# Every node of a cluster must have the same values in this table.
-# A joining node sends a fingerprint of them, and a seed with other values refuses the join.
-[cluster]
-# Subnet of the mesh IPs.
-mesh_subnet = "10.42.0.0/16"
+# Timing and retry values of this node.
+# Nodes can have different values: a difference changes only the behavior of this node.
+[tuning]
 # MTU of both WireGuard interfaces.
 mtu = 1420
 # How often the peer list is synchronized without a membership change.
 peer_resync_interval = "30s"
 
-# chitchat ignores messages with another cluster ID.
-cluster_id = "yaco"
-# UDP port of chitchat, on the mesh IP only.
-gossip_port = 7280
 gossip_interval = "1s"
-# Gossip rounds to wait after a node marks itself as leaving.
+# Gossip rounds to wait after this node marks itself as leaving.
 leave_rounds = 3
-# How long a dead node (and its WireGuard peer) is kept.
-dead_node_grace_period = "1day"
-# How long chitchat keeps deleted keys.
-tombstone_grace_period = "1h"
 # Failure detector. These are the chitchat defaults.
 phi_threshold = 8.0
 sampling_window_size = 1000
 max_heartbeat_interval = "10s"
 initial_heartbeat_interval = "5s"
 
-# TCP port of the join endpoint, inside the bootstrap tunnel.
-join_port = 7283
 join_request_timeout = "5s"
-# How often a joining node tries all seeds before it gives up.
+# How often this node tries all seeds before it gives up.
 join_rounds = 5
 # Pause between two join rounds. A random part of up to the same length is added.
 join_retry_delay = "5s"
-# How many mesh IPs a joining node proposes to one seed before it gives up.
+# How many mesh IPs this node proposes to one seed before it gives up.
 max_mesh_ip_attempts = 16
 
-# TCP port of the node API, on the mesh IP only.
-api_port = 7284
+# Every node of a cluster must have the same values in this table.
+# A joining node sends a fingerprint of them, and a seed with other values refuses the join.
+[cluster]
+# Subnet of the mesh IPs.
+mesh_subnet = "10.42.0.0/16"
+# chitchat ignores messages with another cluster ID.
+cluster_id = "yaco"
+# How long a dead node (and its WireGuard peer) is kept.
+dead_node_grace_period = "1day"
+# How long chitchat keeps deleted keys.
+tombstone_grace_period = "1h"

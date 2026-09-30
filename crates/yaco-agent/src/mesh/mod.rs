@@ -242,7 +242,7 @@ impl Mesh {
             )],
             port: config.node.mesh_port,
             peers: Vec::new(),
-            mtu: Some(config.cluster.mtu),
+            mtu: Some(config.tuning.mtu),
             fwmark: None,
         })
         .with_context(|| format!("cannot configure interface {interface}"))?;

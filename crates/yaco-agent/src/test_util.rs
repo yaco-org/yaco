@@ -5,7 +5,7 @@ use std::collections::HashSet;
 use chitchat::{Chitchat, ChitchatId, DeletionStatus, VersionedValue};
 use tokio::sync::watch;
 
-use crate::config::ClusterConfig;
+use crate::config::{ClusterConfig, TuningConfig};
 use crate::gossip;
 
 pub fn chitchat_id(node_id: &str, generation: u64) -> ChitchatId {
@@ -24,6 +24,7 @@ pub fn chitchat_with_nodes(
         &own.node_id,
         own.gossip_advertise_addr,
         &[],
+        &TuningConfig::default(),
         &ClusterConfig::default(),
     );
     config.chitchat_id = own.clone();

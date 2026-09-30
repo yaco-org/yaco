@@ -29,6 +29,7 @@ Every node has a config file, by default `/etc/yaco/yaco.toml` (change it with `
 Only `node.id` and `node.public_ip` are required.
 The token is not in the config file and should be supplied with `YACO_TOKEN`.
 
+The `[tuning]` table holds timing and retry values of one node. Nodes can have different values.
 The `[cluster]` table must be the same on every node.
 A joining node sends a fingerprint of it, and a seed with another `[cluster]` table refuses the join.
 
@@ -60,7 +61,7 @@ Open these UDP ports on every node (the defaults are shown):
 | 7281 | `node.mesh_port` | Mesh WireGuard interface                         |
 | 7282 | `node.boot_port` | Bootstrap WireGuard interface, for joining nodes |
 
-Gossip (`cluster.gossip_port`, UDP 7280) and the node API (`cluster.api_port`, TCP 7284)
+Gossip (UDP 7280) and the node API (TCP 7284)
 run inside the mesh, on the mesh IP only.
 Do not open them on the public interface.
 
@@ -88,7 +89,7 @@ unshare --user --map-root-user --net sh
 
 ## Node API
 
-Every node serves the node API on its mesh IP (`cluster.api_port`, TCP 7284).
+Every node serves the node API on its mesh IP (TCP 7284).
 `GET /v1/nodes` lists the nodes of the cluster, and `GET /v1/events` streams their changes as server-sent events.
 For example, on a node:
 

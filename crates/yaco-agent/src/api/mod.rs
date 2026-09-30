@@ -12,6 +12,9 @@
 mod convert;
 mod tests;
 
+/// TCP port of the node API, on the mesh IP.
+pub use yaco_api::API_PORT;
+
 use std::convert::Infallible;
 
 use axum::extract::State;
