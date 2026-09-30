@@ -389,6 +389,33 @@
           "leaving"
         ]
       },
+      "MeshFacts": {
+        "type": "object",
+        "description": "How to reach a node over the mesh.",
+        "required": [
+          "wg_public_key",
+          "mesh_ip",
+          "endpoint"
+        ],
+        "properties": {
+          "endpoint": {
+            "type": "string",
+            "description": "Public address and port of the mesh WireGuard interface.",
+            "example": "203.0.113.1:7281"
+          },
+          "mesh_ip": {
+            "type": "string",
+            "format": "ipv4",
+            "description": "Address of the node inside the mesh.",
+            "example": "10.42.58.124"
+          },
+          "wg_public_key": {
+            "type": "string",
+            "description": "WireGuard public key of the mesh interface, base64.",
+            "example": "ERERERERERERERERERERERERERERERERERERERERERE="
+          }
+        }
+      },
       "Node": {
         "type": "object",
         "description": "One node of the cluster, as this node sees it.\nOnly the latest generation of each node ID is shown.",
@@ -400,19 +427,7 @@
         ],
         "properties": {
           "facts": {
-            "type": "object",
-            "description": "Facts that the node publishes about itself.",
-            "additionalProperties": {
-              "type": "string"
-            },
-            "propertyNames": {
-              "type": "string"
-            },
-            "example": {
-              "endpoint": "203.0.113.1:7281",
-              "mesh_ip": "10.42.58.124",
-              "wg_public_key": "ERERERERERERERERERERERERERERERERERERERERERE="
-            }
+            "$ref": "#/components/schemas/NodeFacts"
           },
           "generation": {
             "type": "integer",
@@ -428,6 +443,23 @@
           },
           "liveness": {
             "$ref": "#/components/schemas/Liveness"
+          }
+        }
+      },
+      "NodeFacts": {
+        "type": "object",
+        "description": "Facts that a node publishes about itself.",
+        "properties": {
+          "mesh": {
+            "oneOf": [
+              {
+                "$ref": "#/components/schemas/MeshFacts",
+                "description": "Absent if the node published no mesh facts, or facts that this node cannot read."
+              },
+              {
+                "type": "null"
+              }
+            ]
           }
         }
       }
